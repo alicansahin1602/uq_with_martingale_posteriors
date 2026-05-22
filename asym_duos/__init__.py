@@ -5,7 +5,6 @@ from .train_eval import (
     EvidentialTrainer,
     FTTrainer,
     UpdateRegWeightCallback,
-    plot_predictions,
 )
 from .utils import (
     _softmax_from_log,
@@ -27,7 +26,6 @@ __all__ = [
     'EvidentialTrainer',
     'FTTrainer',
     'UpdateRegWeightCallback',
-    'plot_predictions',
     '_softmax_from_log',
     'compute_uncertainty_metrics',
     'optimize_laplace',
