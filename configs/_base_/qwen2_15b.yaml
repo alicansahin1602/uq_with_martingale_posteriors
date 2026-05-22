@@ -1,0 +1,27 @@
+model:
+    model_name_or_path: "Qwen/Qwen2-1.5B"
+    peft_path: null
+    model_cfg:
+        type: AutoModelForCausalLM
+        torch_dtype: bfloat16
+    tokenizer_cfg:
+        type: AutoTokenizer
+        use_fast: true
+    special_tokens:
+        pad_token: "<|endoftext|>"  # Qwen2 has no dedicated pad token; reuse EOS
+    use_peft: True
+    peft_cfg:
+        type: LoraConfig
+        r: 8
+        lora_alpha: 16
+        lora_dropout: 0.1
+        task_type: "CAUSAL_LM"
+        inference_mode: false
+        bias: lora_only
+        target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]  # Qwen2 GQA attention projections
+
+tokenizer_run_cfg:
+    padding: true
+    truncation: true
+    return_tensors: "pt"
+    max_length: 300
