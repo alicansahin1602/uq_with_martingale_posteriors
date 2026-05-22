@@ -44,6 +44,7 @@ import mmengine
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import ConcatDataset
 from mmengine.runner.utils import set_random_seed
 
 from asym_duos import DATASETS, get_model_and_tokenizer, setup_logger
@@ -73,11 +74,8 @@ def parse_args():
     p.add_argument("--n-samples", type=int, default=None,
                    help="Number of questions to evaluate (None = full split).")
     p.add_argument("--split", default="test",
-                   choices=["train", "val", "test"],
-                   help="Dataset split to evaluate on.")
-    # batch_size  → cfg.train_cfg.per_device_eval_batch_size
-    # max_length  → cfg.tokenizer_run_cfg.max_length
-
+                   choices=["train", "val", "test", "all"],
+                   help="Dataset split to evaluate on. 'all' concatenates train+val+test.")
     # Config overrides
     p.add_argument("--cfg-options", "-o", nargs="+", action=mmengine.DictAction,
                    help="Override config values, e.g. model.use_peft=False.")
@@ -385,7 +383,8 @@ def main():
         args.K = 3
         args.n_samples = 8
         cfg.train_cfg["per_device_eval_batch_size"] = 4
-        cfg.data[args.split]["subset_size"] = 8
+        for s in (["train", "val", "test"] if args.split == "all" else [args.split]):
+            cfg.data[s]["subset_size"] = 8
 
     # Warn if the config would attach an untrained PEFT adapter
     if cfg.model.get("use_peft") and cfg.model.get("peft_path") is None:
@@ -417,14 +416,17 @@ def main():
     model.eval()
 
     # Build dataset
-    dataset = DATASETS.build(
-        cfg.data[args.split], default_args=dict(tokenizer=tokenizer)
-    )
-    target_ids = dataset.target_ids.to(device)
+    _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
+    splits = [
+        DATASETS.build(cfg.data[s], default_args=dict(tokenizer=tokenizer))
+        for s in _split_names
+    ]
+    target_ids = splits[0].target_ids.to(device)
+    dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
     n_classes = target_ids.shape[0]
 
     logger.info(
-        f"Dataset: {type(dataset).__name__}  "
+        f"Dataset: {'+'.join(_split_names)}  "
         f"size={len(dataset)}  n_classes={n_classes}"
     )
     logger.info(f"Running martingale check: K={args.K} iterations ...")
