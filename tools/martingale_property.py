@@ -61,7 +61,7 @@ def parse_args():
         description="WP1: Martingale property check for LLMs on Q&A benchmarks."
     )
     p.add_argument("--config", required=True,
-                   help="Config file (same format as train.py --config-base).")
+                   help="Config file for the model to evaluate.")
     p.add_argument("--work-dir", "-w", required=True,
                    help="Root directory for outputs.")
     p.add_argument("--seed", type=int, default=42)
@@ -187,6 +187,7 @@ def run_martingale_check(
         true_labels    (N,)
         input_texts    list[str]   -- raw initial prompt per question
         data_indices   (N,)        -- dataset row ids
+        prompt_history (N, K+1)   -- exact prompt fed to the model at each step
     """
     n_classes = target_ids.shape[0]
     label_chars = [chr(ord("A") + i) for i in range(n_classes)]
@@ -215,8 +216,11 @@ def run_martingale_check(
     # Per-question answer history accumulated across iterations
     history: List[List[str]] = [[] for _ in range(N)]
     current_prompts = list(initial_prompts)
+    # all_prompts[k] holds the N prompts fed to the model at step k
+    all_prompts: List[List[str]] = []
 
     for k in range(K + 1):
+        all_prompts.append(list(current_prompts))
         logger.info(f"  Iteration k={k}/{K} ...")
         probs_k = np.zeros((N, n_classes), dtype=np.float32)
 
@@ -244,11 +248,15 @@ def run_martingale_check(
                 )
             current_prompts = next_prompts
 
+    # Reshape to (N, K+1): all_prompts[k][i] -> prompt_history[i][k]
+    prompt_history = np.array(all_prompts, dtype=object).T  # (N, K+1)
+
     return {
         "distributions": distributions,
         "true_labels": true_labels,
         "input_texts": input_texts,
         "data_indices": data_indices,
+        "prompt_history": prompt_history,
     }
 
 
@@ -317,6 +325,7 @@ def save_results(
     true_labels: np.ndarray,
     data_indices: np.ndarray,
     input_texts: List[str],
+    prompt_history: np.ndarray,
     metrics: dict,
     logger,
 ) -> str:
@@ -336,6 +345,7 @@ def save_results(
         "true_labels": true_labels,              # (N,)
         "data_indices": data_indices,            # (N,)
         "input_texts": np.array(input_texts, dtype=object),
+        "prompt_history": prompt_history,        # (N, K+1) prompts fed at each step
         "K": np.int32(K),
         # Scalar metrics
         "mean_tv": np.float32(metrics["mean_tv"]),
@@ -463,6 +473,7 @@ def main():
         true_labels=result["true_labels"],
         data_indices=result["data_indices"],
         input_texts=result["input_texts"],
+        prompt_history=result["prompt_history"],
         metrics=metrics,
         logger=logger,
     )
