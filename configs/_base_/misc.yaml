@@ -1,0 +1,3 @@
+process_preds:
+    # npz_file being "null" means that the predictions will not be saved
+    npz_file: null

@@ -1,0 +1,23 @@
+_base_: ['../_base_/csqa.yaml', '../_base_/qwen2_7b.yaml', '../_base_/misc.yaml', '../_base_/edl_schedule.yaml']
+
+train_cfg:
+    max_steps: 30000
+
+process_preds:
+    npz_file: "csqa.npz"
+
+edl_loss_cfg:
+    bayesian_loss:
+        type: ss
+        smooth: null
+    reg_loss:
+        type: kl
+        modify_alphas: True
+    reg_weight_cfg:
+        start_epoch: 0.1
+        final_reg_weight: 0.0
+
+vib:
+    num_noises: 20
+    beta: 0.00009
+    sigma_mult: 0.0
