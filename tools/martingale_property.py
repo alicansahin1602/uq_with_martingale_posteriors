@@ -6,47 +6,48 @@ measuring how much the output distribution drifts:
 
     E[p(y | y_{1:n}, Y_{n+1:n+k}) | y_{1:n}] = p(y | y_{1:n})
 
-If this holds, the mean of the iterated distributions p_1, ..., p_K should
-stay close to the initial distribution p_0 (measured by TV distance).
+Supports both open-source (HuggingFace) and closed-source (OpenAI, Anthropic)
+models through a unified provider interface.
 
-The script reuses the same config format, model builder, and dataset registry
-as train.py -- it only adds the iterative-prompting loop on top.
-
-Usage
------
-# Zero-shot base model (no PEFT)
+Open-source (HuggingFace) — config unchanged from train.py
+-----------------------------------------------------------
 python tools/martingale_property.py \\
     --config configs/arc_c_qwen2_7b/lora_arc_c_qwen2_7b.yaml \\
-    -w data/results_mp \\
-    --K 20 --n-samples 200 --seed 42 \\
+    -w data/results_mp --K 20 --n-samples 200 --seed 42 \\
     --cfg-options model.use_peft=False
 
-# Fine-tuned model (peft_path must point to a trained checkpoint)
-python tools/martingale_property.py \\
-    --config configs/arc_c_qwen2_7b/lora_arc_c_qwen2_7b.yaml \\
-    -w data/results_mp \\
-    --K 20 --n-samples 200 --seed 42 \\
-    --cfg-options model.peft_path=/path/to/checkpoint
+Closed-source (API) — add api_model section to config
+------------------------------------------------------
+The `model` section is still required to load the tokenizer for prompt
+formatting; model weights are not loaded when `api_model` is present.
 
-# Quick smoke test
-python tools/martingale_property.py \\
-    --config configs/arc_c_qwen2_7b/lora_arc_c_qwen2_7b.yaml \\
-    -w data/results_mp --test-run \\
-    --cfg-options model.use_peft=False
+    # configs/arc_c_gpt4o/martingale_arc_c_gpt4o.yaml
+    _base_: ['../_base_/arc_c.yaml', '../_base_/qwen2_7b.yaml',
+             '../_base_/misc.yaml', '../_base_/non_edl_schedule.yaml']
+    api_model:
+        provider: openai          # openai | anthropic
+        model_name: gpt-4o
+        use_logprobs: true        # OpenAI only; false falls back to sampling
+        n_samples: 30             # samples per prompt (sampling mode / Anthropic)
+
+Set OPENAI_API_KEY or ANTHROPIC_API_KEY in the environment before running.
 """
 
 import argparse
 import os.path as osp
+from copy import deepcopy
 from datetime import datetime
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import mmengine
 import numpy as np
 import torch
 import torch.nn.functional as F
+import transformers
 from torch.utils.data import ConcatDataset
 from mmengine.runner.utils import set_random_seed
-
+import openai
+import anthropic
 from asym_duos import DATASETS, get_model_and_tokenizer, setup_logger
 
 # All dataset preambles end with this exact suffix.
@@ -128,28 +129,130 @@ def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Model inference
+# Tokenizer-only loader (used by API providers that skip model weight loading)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def _get_class_probs_batch(
+def _load_tokenizer_only(cfg) -> transformers.PreTrainedTokenizer:
+    """Load just the tokenizer from the model config section, no weights."""
+    tokenizer_cfg = deepcopy(dict(cfg.model.tokenizer_cfg))
+    tokenizer_cls = getattr(transformers, tokenizer_cfg.pop("type"))
+    tokenizer = tokenizer_cls.from_pretrained(
+        cfg.model.model_name_or_path, **tokenizer_cfg
+    )
+    special_tokens = {
+        k: getattr(tokenizer, v.split(".")[-1])
+        if isinstance(v, str) and v.startswith("tokenizer")
+        else v
+        for k, v in cfg.model.special_tokens.items()
+    }
+    if special_tokens:
+        tokenizer.add_special_tokens(special_tokens)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Provider factories — each returns Callable[[List[str]], np.ndarray]
+# ---------------------------------------------------------------------------
+
+def _build_hf_provider(
     model,
     tokenizer,
-    prompts: List[str],
     target_ids: torch.Tensor,
     tokenizer_run_cfg: dict,
     device: torch.device,
-) -> np.ndarray:
-    """Single batched forward pass → softmax class probabilities.
+) -> Callable[[List[str]], np.ndarray]:
+    """HuggingFace open-source provider: batched forward pass over logits."""
+    @torch.no_grad()
+    def get_probs(prompts: List[str]) -> np.ndarray:
+        inputs = tokenizer(prompts, **tokenizer_run_cfg).to(device)
+        logits = model(**inputs).logits[:, -1, target_ids]  # (B, n_classes)
+        return F.softmax(logits.float(), dim=-1).cpu().numpy()
+    return get_probs
 
-    Returns
-    -------
-    probs : np.ndarray, shape (len(prompts), n_classes)
+
+def _build_openai_provider(
+    model_name: str,
+    label_chars: List[str],
+    use_logprobs: bool,
+    n_samples: int,
+) -> Callable[[List[str]], np.ndarray]:
+    """OpenAI provider.
+
+    use_logprobs=True  — one API call per prompt using top_logprobs (fast, exact).
+    use_logprobs=False — n_samples calls per prompt using temperature sampling.
     """
-    inputs = tokenizer(prompts, **tokenizer_run_cfg).to(device)
-    logits = model(**inputs).logits[:, -1, target_ids]  # (B, n_classes)
-    probs = F.softmax(logits.float(), dim=-1).cpu().numpy()
-    return probs
+
+    client = openai.OpenAI()
+    n_classes = len(label_chars)
+
+    def get_probs(prompts: List[str]) -> np.ndarray:
+        probs = np.zeros((len(prompts), n_classes), dtype=np.float32)
+        for i, prompt in enumerate(prompts):
+            if use_logprobs:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=1,
+                    logprobs=True,
+                    top_logprobs=20,
+                )
+                top = resp.choices[0].logprobs.content[0].top_logprobs
+                log_p = {t.token.strip(): t.logprob for t in top}
+                raw = np.array(
+                    [np.exp(log_p[c]) if c in log_p else 1e-10 for c in label_chars],
+                    dtype=np.float64,
+                )
+                probs[i] = (raw / raw.sum()).astype(np.float32)
+            else:
+                counts = np.zeros(n_classes, dtype=np.float64)
+                for _ in range(n_samples):
+                    resp = client.chat.completions.create(
+                        model=model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=1,
+                        temperature=1.0,
+                    )
+                    ans = resp.choices[0].message.content.strip().upper()
+                    if ans in label_chars:
+                        counts[label_chars.index(ans)] += 1
+                    else:
+                        counts += 1.0 / n_classes  # uniform fallback for off-label replies
+                probs[i] = (counts / counts.sum()).astype(np.float32)
+        return probs
+
+    return get_probs
+
+
+def _build_anthropic_provider(
+    model_name: str,
+    label_chars: List[str],
+    n_samples: int,
+) -> Callable[[List[str]], np.ndarray]:
+    """Anthropic provider: sampling-based (no logprob API available)."""
+    client = anthropic.Anthropic()
+    n_classes = len(label_chars)
+
+    def get_probs(prompts: List[str]) -> np.ndarray:
+        probs = np.zeros((len(prompts), n_classes), dtype=np.float32)
+        for i, prompt in enumerate(prompts):
+            counts = np.zeros(n_classes, dtype=np.float64)
+            for _ in range(n_samples):
+                resp = client.messages.create(
+                    model=model_name,
+                    max_tokens=1,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                ans = resp.content[0].text.strip().upper()
+                if ans in label_chars:
+                    counts[label_chars.index(ans)] += 1
+                else:
+                    counts += 1.0 / n_classes
+            probs[i] = (counts / counts.sum()).astype(np.float32)
+        return probs
+
+    return get_probs
 
 
 # ---------------------------------------------------------------------------
@@ -157,12 +260,9 @@ def _get_class_probs_batch(
 # ---------------------------------------------------------------------------
 
 def run_martingale_check(
-    model,
-    tokenizer,
+    get_probs: Callable[[List[str]], np.ndarray],
+    n_classes: int,
     dataset,
-    target_ids: torch.Tensor,
-    tokenizer_run_cfg: dict,
-    device: torch.device,
     K: int,
     n_samples: Optional[int],
     batch_size: int,
@@ -172,9 +272,12 @@ def run_martingale_check(
     """Iterate K feedback steps and record the full distribution trajectory.
 
     At each step k:
-      1. Run a batched forward pass on the current prompts → p_k.
+      1. Call get_probs on the current prompts → p_k.
       2. Sample a label from p_k for each question.
       3. Rebuild prompts with the sampled label appended to the history.
+
+    get_probs is a provider callable built by one of the _build_*_provider
+    factories; it abstracts over HuggingFace, OpenAI, and Anthropic backends.
 
     Returns
     -------
@@ -185,7 +288,6 @@ def run_martingale_check(
         data_indices   (N,)        -- dataset row ids
         prompt_history (N, K+1)   -- exact prompt fed to the model at each step
     """
-    n_classes = target_ids.shape[0]
     label_chars = [chr(ord("A") + i) for i in range(n_classes)]
 
     N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
@@ -222,12 +324,7 @@ def run_martingale_check(
 
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
-            batch_probs = _get_class_probs_batch(
-                model, tokenizer,
-                current_prompts[start:end],
-                target_ids, tokenizer_run_cfg, device,
-            )
-            probs_k[start:end] = batch_probs
+            probs_k[start:end] = get_probs(current_prompts[start:end])
 
         distributions[:, k, :] = probs_k
 
@@ -411,19 +508,51 @@ def main():
         f"seed={args.seed}  split={args.split}"
     )
 
-    # Load model (inference only — no training)
-    model, tokenizer = get_model_and_tokenizer(**cfg.model, device=device)
-    model.eval()
+    # Build provider and dataset — dispatch on whether api_model is present
+    api_cfg = cfg.get("api_model", None)
 
-    # Build dataset
-    _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
-    splits = [
-        DATASETS.build(cfg.data[s], default_args=dict(tokenizer=tokenizer))
-        for s in _split_names
-    ]
-    target_ids = splits[0].target_ids.to(device)
-    dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
-    n_classes = target_ids.shape[0]
+    if api_cfg is not None:
+        # Closed-source path: load only the tokenizer for prompt formatting
+        tokenizer = _load_tokenizer_only(cfg)
+        _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
+        splits = [
+            DATASETS.build(cfg.data[s], default_args=dict(tokenizer=tokenizer))
+            for s in _split_names
+        ]
+        dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
+        n_classes = splits[0].n_labels
+        label_chars = [chr(ord("A") + i) for i in range(n_classes)]
+        provider = api_cfg.provider.lower()
+        if provider == "openai":
+            get_probs = _build_openai_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                use_logprobs=api_cfg.get("use_logprobs", True),
+                n_samples=api_cfg.get("n_samples", 30),
+            )
+        elif provider == "anthropic":
+            get_probs = _build_anthropic_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                n_samples=api_cfg.get("n_samples", 30),
+            )
+        else:
+            raise ValueError(f"Unknown api_model.provider '{provider}'. Use 'openai' or 'anthropic'.")
+        logger.info(f"API provider: {provider} / {api_cfg.model_name}")
+    else:
+        # Open-source path: load HuggingFace model + tokenizer
+        model, tokenizer = get_model_and_tokenizer(**cfg.model, device=device)
+        model.eval()
+        _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
+        splits = [
+            DATASETS.build(cfg.data[s], default_args=dict(tokenizer=tokenizer))
+            for s in _split_names
+        ]
+        target_ids = splits[0].target_ids.to(device)
+        dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
+        n_classes = target_ids.shape[0]
+        get_probs = _build_hf_provider(model, tokenizer, target_ids, tokenizer_run_cfg, device)
+        logger.info(f"HuggingFace provider: {cfg.model.model_name_or_path}")
 
     logger.info(
         f"Dataset: {'+'.join(_split_names)}  "
@@ -432,12 +561,9 @@ def main():
     logger.info(f"Running martingale check: K={args.K} iterations ...")
 
     result = run_martingale_check(
-        model=model,
-        tokenizer=tokenizer,
+        get_probs=get_probs,
+        n_classes=n_classes,
         dataset=dataset,
-        target_ids=target_ids,
-        tokenizer_run_cfg=tokenizer_run_cfg,
-        device=device,
         K=args.K,
         n_samples=args.n_samples,
         batch_size=batch_size,
