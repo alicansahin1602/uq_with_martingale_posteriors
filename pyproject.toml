@@ -40,6 +40,10 @@ dev = [
     "ipykernel",
     "jupyter",
 ]
+api = [
+    "openai>=1.0.0",
+    "anthropic>=0.20.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
