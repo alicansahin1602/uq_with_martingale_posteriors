@@ -55,14 +55,17 @@ class ClassificationDataset(Dataset):
         else:  # alphabetical
             labels = [f"{spc}{chr(ord('A')+i)}" for i in range(self.n_labels)]
         # assume these encode to single tokens
-        self._target_ids = tokenizer(labels, return_tensors='pt', add_special_tokens=False).input_ids[:, -1:]
-        self._target_ids = self._target_ids.squeeze()
+        if self.tokenizer:
+            self._target_ids = tokenizer(labels, return_tensors='pt', add_special_tokens=False).input_ids[:, -1:]
+            self._target_ids = self._target_ids.squeeze()
+        else:
+            self._target_ids = None
         """A mapping from label _indices_ to target token ids. This is only useful for CausalLM models.
         Example: {(0, 345), (1, 673), (2, 736)}
         """
-        self.label2target = OrderedDict([(i, self.target_ids[i]) for i in range(n_labels)])
+        self.label2target = OrderedDict([(i, self.target_ids[i]) for i in range(n_labels)]) if self.target_ids is not None else None
         # misnomer: should be target 2 label _index_
-        self.target2label = OrderedDict([(self.target_ids[i], i) for i in range(n_labels)])
+        self.target2label = OrderedDict([(self.target_ids[i], i) for i in range(n_labels)]) if self.target_ids is not None else None
 
         if noisy_level is not None and noisy_level > 0:
             logger = setup_logger('ib-edl')
@@ -73,7 +76,7 @@ class ClassificationDataset(Dataset):
 
     @property
     def target_ids(self):
-        return self._target_ids.clone().detach()
+        return self._target_ids.clone().detach() if self._target_ids is not None else None
 
     @property
     def label_chars(self) -> list:

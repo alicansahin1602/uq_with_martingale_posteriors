@@ -62,6 +62,7 @@ def run_martingale_check(
     batch_size: int,
     rng: np.random.Generator,
     logger,
+    label_chars: list
 ) -> dict:
     """Iterate K feedback steps and record the full distribution trajectory.
 
@@ -82,8 +83,6 @@ def run_martingale_check(
         data_indices   (N,)        -- dataset row ids
         prompt_history (N, K+1)   -- exact prompt fed to the model at each step
     """
-    label_chars = [chr(ord("A") + i) for i in range(n_classes)]
-
     N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
 
     distributions = np.zeros((N, K + 1, n_classes), dtype=np.float32)
