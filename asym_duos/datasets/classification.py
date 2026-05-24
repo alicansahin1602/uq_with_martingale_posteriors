@@ -42,6 +42,7 @@ class ClassificationDataset(Dataset):
         self.add_space = add_space
         self.tokenizer = tokenizer
         self.numerical = numerical
+        self.boolean = boolean
 
         spc = ' ' if self.add_space else ''
         """Token ids of class labels. Example [345, 673, 736]."""
@@ -73,6 +74,14 @@ class ClassificationDataset(Dataset):
     @property
     def target_ids(self):
         return self._target_ids.clone().detach()
+
+    @property
+    def label_chars(self) -> list:
+        if self.boolean:
+            return ['True', 'False']
+        if self.numerical:
+            return [str(i) for i in range(self.n_labels)]
+        return [chr(ord('A') + i) for i in range(self.n_labels)]
 
     @abstractmethod
     def get_collate_fn(self) -> Callable:
