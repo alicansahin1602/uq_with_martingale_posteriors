@@ -6,52 +6,53 @@ measuring how much the output distribution drifts:
 
     E[p(y | y_{1:n}, Y_{n+1:n+k}) | y_{1:n}] = p(y | y_{1:n})
 
-If this holds, the mean of the iterated distributions p_1, ..., p_K should
-stay close to the initial distribution p_0 (measured by TV distance).
+Supports both open-source (HuggingFace) and closed-source (OpenAI, Anthropic)
+models through a unified provider interface.
 
-The script reuses the same config format, model builder, and dataset registry
-as train.py -- it only adds the iterative-prompting loop on top.
-
-Usage
------
-# Zero-shot base model (no PEFT)
+Open-source (HuggingFace) — config unchanged from train.py
+-----------------------------------------------------------
 python tools/martingale_property.py \\
     --config configs/arc_c_qwen2_7b/lora_arc_c_qwen2_7b.yaml \\
-    -w data/results_mp \\
-    --K 20 --n-samples 200 --seed 42 \\
+    -w data/results_mp --K 20 --n-samples 200 --seed 42 \\
     --cfg-options model.use_peft=False
 
-# Fine-tuned model (peft_path must point to a trained checkpoint)
-python tools/martingale_property.py \\
-    --config configs/arc_c_qwen2_7b/lora_arc_c_qwen2_7b.yaml \\
-    -w data/results_mp \\
-    --K 20 --n-samples 200 --seed 42 \\
-    --cfg-options model.peft_path=/path/to/checkpoint
+Closed-source (API) — add api_model section to config
+------------------------------------------------------
+The `model` section is still required to load the tokenizer for prompt
+formatting; model weights are not loaded when `api_model` is present.
 
-# Quick smoke test
-python tools/martingale_property.py \\
-    --config configs/arc_c_qwen2_7b/lora_arc_c_qwen2_7b.yaml \\
-    -w data/results_mp --test-run \\
-    --cfg-options model.use_peft=False
+    # configs/arc_c_gpt4o/martingale_arc_c_gpt4o.yaml
+    _base_: ['../_base_/arc_c.yaml', '../_base_/qwen2_7b.yaml',
+             '../_base_/misc.yaml', '../_base_/non_edl_schedule.yaml']
+    api_model:
+        provider: openai          # openai | anthropic
+        model_name: gpt-4o
+        use_logprobs: true        # OpenAI only; false falls back to sampling
+        n_samples: 30             # samples per prompt (sampling mode / Anthropic)
+
+Set OPENAI_API_KEY or ANTHROPIC_API_KEY in the environment before running.
 """
 
 import argparse
 import os.path as osp
 from datetime import datetime
-from typing import List, Optional
 
 import mmengine
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import ConcatDataset
 from mmengine.runner.utils import set_random_seed
-
-from asym_duos import DATASETS, get_model_and_tokenizer, setup_logger
-
-# All dataset preambles end with this exact suffix.
-_ANSWER_SUFFIX = "\nAnswer:"
-
+from asym_duos import (
+     DATASETS, 
+     get_model_and_tokenizer, 
+     setup_logger,
+     _build_hf_provider,
+     _build_openai_provider,
+     _build_anthropic_provider,
+     run_martingale_check,
+     compute_martingale_metrics,
+     save_martingale_results
+)
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -97,270 +98,6 @@ def _build_work_dir(root: str, cfg_path: str) -> str:
     folder = osp.basename(osp.dirname(cfg_path))
     return osp.join(root, folder, "martingale_check")
 
-
-# ---------------------------------------------------------------------------
-# Prompt utilities
-# ---------------------------------------------------------------------------
-
-def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
-    """Splice the answer history into a prompt just before 'Answer:'.
-
-    Turns:
-        ...
-        Choices:
-        A) ...
-        Answer:
-    Into:
-        ...
-        Choices:
-        A) ...
-        Your previous answers were: A, C, B
-        Answer:
-    """
-    if not initial_prompt.endswith(_ANSWER_SUFFIX):
-        raise ValueError(
-            f"Prompt does not end with '{_ANSWER_SUFFIX}'. "
-            "Check that the dataset preamble is unchanged."
-        )
-    body = initial_prompt[: -len(_ANSWER_SUFFIX)]
-    history = ", ".join(prev_labels)
-    return f"{body}\nYour previous answers were: {history}{_ANSWER_SUFFIX}"
-
-
-# ---------------------------------------------------------------------------
-# Model inference
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def _get_class_probs_batch(
-    model,
-    tokenizer,
-    prompts: List[str],
-    target_ids: torch.Tensor,
-    tokenizer_run_cfg: dict,
-    device: torch.device,
-) -> np.ndarray:
-    """Single batched forward pass → softmax class probabilities.
-
-    Returns
-    -------
-    probs : np.ndarray, shape (len(prompts), n_classes)
-    """
-    inputs = tokenizer(prompts, **tokenizer_run_cfg).to(device)
-    logits = model(**inputs).logits[:, -1, target_ids]  # (B, n_classes)
-    probs = F.softmax(logits.float(), dim=-1).cpu().numpy()
-    return probs
-
-
-# ---------------------------------------------------------------------------
-# Main martingale check loop
-# ---------------------------------------------------------------------------
-
-def run_martingale_check(
-    model,
-    tokenizer,
-    dataset,
-    target_ids: torch.Tensor,
-    tokenizer_run_cfg: dict,
-    device: torch.device,
-    K: int,
-    n_samples: Optional[int],
-    batch_size: int,
-    rng: np.random.Generator,
-    logger,
-) -> dict:
-    """Iterate K feedback steps and record the full distribution trajectory.
-
-    At each step k:
-      1. Run a batched forward pass on the current prompts → p_k.
-      2. Sample a label from p_k for each question.
-      3. Rebuild prompts with the sampled label appended to the history.
-
-    Returns
-    -------
-    dict with keys:
-        distributions  (N, K+1, C) -- p_0 through p_K for every question
-        true_labels    (N,)
-        input_texts    list[str]   -- raw initial prompt per question
-        data_indices   (N,)        -- dataset row ids
-        prompt_history (N, K+1)   -- exact prompt fed to the model at each step
-    """
-    n_classes = target_ids.shape[0]
-    label_chars = [chr(ord("A") + i) for i in range(n_classes)]
-
-    N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
-
-    distributions = np.zeros((N, K + 1, n_classes), dtype=np.float32)
-    true_labels = np.zeros(N, dtype=np.int32)
-    input_texts: List[str] = []
-
-    # Build initial prompts and collect ground-truth labels
-    initial_prompts: List[str] = []
-    for i in range(N):
-        sample = dataset[i]
-        initial_prompts.append(sample["prompt"])
-        true_labels[i] = int(sample["label"])
-        input_texts.append(sample["prompt"])
-
-    # Row ids (best-effort; fall back to positional indices)
-    try:
-        all_row_ids = dataset.get_data_indices()
-        data_indices = np.array([all_row_ids[i] for i in range(N)], dtype=np.int32)
-    except Exception:
-        data_indices = np.arange(N, dtype=np.int32)
-
-    # Per-question answer history accumulated across iterations
-    history: List[List[str]] = [[] for _ in range(N)]
-    current_prompts = list(initial_prompts)
-    # all_prompts[k] holds the N prompts fed to the model at step k
-    all_prompts: List[List[str]] = []
-
-    for k in range(K + 1):
-        all_prompts.append(list(current_prompts))
-        logger.info(f"  Iteration k={k}/{K} ...")
-        probs_k = np.zeros((N, n_classes), dtype=np.float32)
-
-        for start in range(0, N, batch_size):
-            end = min(start + batch_size, N)
-            batch_probs = _get_class_probs_batch(
-                model, tokenizer,
-                current_prompts[start:end],
-                target_ids, tokenizer_run_cfg, device,
-            )
-            probs_k[start:end] = batch_probs
-
-        distributions[:, k, :] = probs_k
-
-        if k < K:
-            next_prompts: List[str] = []
-            for i in range(N):
-                # Renormalise to guard against float32 rounding before sampling
-                p = probs_k[i].astype(np.float64)
-                p /= p.sum()
-                sampled_idx = int(rng.choice(n_classes, p=p))
-                history[i].append(label_chars[sampled_idx])
-                next_prompts.append(
-                    _insert_prev_answers(initial_prompts[i], history[i])
-                )
-            current_prompts = next_prompts
-
-    # Reshape to (N, K+1): all_prompts[k][i] -> prompt_history[i][k]
-    prompt_history = np.array(all_prompts, dtype=object).T  # (N, K+1)
-
-    return {
-        "distributions": distributions,
-        "true_labels": true_labels,
-        "input_texts": input_texts,
-        "data_indices": data_indices,
-        "prompt_history": prompt_history,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def compute_martingale_metrics(distributions: np.ndarray, true_labels: np.ndarray) -> dict:
-    """Compute drift statistics from the full distribution trajectory.
-
-    Parameters
-    ----------
-    distributions : (N, K+1, C)
-    true_labels   : (N,)
-
-    Returns
-    -------
-    dict of scalar summary metrics and per-question / per-step arrays.
-    """
-    p0 = distributions[:, 0, :]       # (N, C)  initial distribution
-    p_iter = distributions[:, 1:, :]  # (N, K, C) iterated distributions
-
-    # Mean iterated distribution per question -- martingale says this ≈ p0
-    p_mean = p_iter.mean(axis=1)      # (N, C)
-
-    # TV distance between mean iterated and initial: 0.5 * ||p_mean - p0||_1
-    tv_per_q = 0.5 * np.abs(p_mean - p0).sum(axis=-1)           # (N,)
-
-    # L1 drift at each step: ||p_k - p0||_1
-    l1_drift = np.abs(p_iter - p0[:, None, :]).sum(axis=-1)      # (N, K)
-
-    # Drift profile: mean L1 drift at each step (averaged over questions)
-    drift_profile = l1_drift.mean(axis=0)                        # (K,)
-
-    # Variance of each class probability across iterations (per question)
-    class_variance = p_iter.var(axis=1)                          # (N, C)
-
-    # Greedy accuracy on the initial prediction
-    pred_labels = p0.argmax(axis=-1)
-    accuracy = float((pred_labels == true_labels).mean())
-
-    return {
-        # Scalar summaries
-        "mean_tv": float(tv_per_q.mean()),
-        "pass_rate_tv_005": float((tv_per_q < 0.05).mean()),
-        "pass_rate_tv_010": float((tv_per_q < 0.10).mean()),
-        "mean_l1": float(l1_drift.mean()),
-        "accuracy_at_p0": accuracy,
-        # Arrays
-        "tv_per_question": tv_per_q,
-        "mean_l1_per_question": l1_drift.mean(axis=1),
-        "drift_profile": drift_profile,
-        "class_variance": class_variance,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
-def save_results(
-    work_dir: str,
-    seed: int,
-    K: int,
-    distributions: np.ndarray,
-    true_labels: np.ndarray,
-    data_indices: np.ndarray,
-    input_texts: List[str],
-    prompt_history: np.ndarray,
-    metrics: dict,
-    logger,
-) -> str:
-    """Append results for this seed to <work_dir>/martingale_results.npz.
-
-    The npz mirrors the structure used by save_predictions: top-level keys are
-    seed strings, values are nested dicts (saved as numpy object arrays).
-    """
-    mmengine.mkdir_or_exist(work_dir)
-    out_path = osp.join(work_dir, "martingale_results.npz")
-
-    existing = (
-        dict(np.load(out_path, allow_pickle=True)) if osp.exists(out_path) else {}
-    )
-    existing[str(seed)] = {
-        "distributions": distributions,          # (N, K+1, C)
-        "true_labels": true_labels,              # (N,)
-        "data_indices": data_indices,            # (N,)
-        "input_texts": np.array(input_texts, dtype=object),
-        "prompt_history": prompt_history,        # (N, K+1) prompts fed at each step
-        "K": np.int32(K),
-        # Scalar metrics
-        "mean_tv": np.float32(metrics["mean_tv"]),
-        "pass_rate_tv_005": np.float32(metrics["pass_rate_tv_005"]),
-        "pass_rate_tv_010": np.float32(metrics["pass_rate_tv_010"]),
-        "mean_l1": np.float32(metrics["mean_l1"]),
-        "accuracy_at_p0": np.float32(metrics["accuracy_at_p0"]),
-        # Per-question / per-step arrays
-        "tv_per_question": metrics["tv_per_question"],
-        "mean_l1_per_question": metrics["mean_l1_per_question"],
-        "drift_profile": metrics["drift_profile"],
-        "class_variance": metrics["class_variance"],
-    }
-
-    np.savez_compressed(out_path, **existing)
-    logger.info(f"Results saved to {out_path}")
-    return out_path
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -382,17 +119,11 @@ def main():
     if args.test_run:
         args.K = 3
         args.n_samples = 8
-        cfg.train_cfg["per_device_eval_batch_size"] = 4
         for s in (["train", "val", "test"] if args.split == "all" else [args.split]):
             cfg.data[s]["subset_size"] = 8
-
-    # Warn if the config would attach an untrained PEFT adapter
-    if cfg.model.get("use_peft") and cfg.model.get("peft_path") is None:
-        print(
-            "[martingale_property] WARNING: use_peft=True but peft_path is None. "
-            "An untrained LoRA adapter will be attached. "
-            "For zero-shot evaluation pass --cfg-options model.use_peft=False."
-        )
+        ## Reduce the batch_size for open source models
+        if not cfg.api_model:
+            cfg.train_cfg["per_device_eval_batch_size"] = 4
 
     work_dir = _build_work_dir(args.work_dir, args.config)
     mmengine.mkdir_or_exist(work_dir)
@@ -402,28 +133,73 @@ def main():
         filepath=osp.join(work_dir, f"{timestamp}.log"),
     )
     logger.info(f"Config:\n{'='*60}\n{cfg.pretty_text}\n{'='*60}")
-    batch_size = cfg.train_cfg.per_device_eval_batch_size
-    tokenizer_run_cfg = dict(cfg.tokenizer_run_cfg)
+
 
     logger.info(
         f"K={args.K}  n_samples={args.n_samples}  "
-        f"batch_size={batch_size}  max_length={tokenizer_run_cfg['max_length']}  "
         f"seed={args.seed}  split={args.split}"
     )
 
-    # Load model (inference only — no training)
-    model, tokenizer = get_model_and_tokenizer(**cfg.model, device=device)
-    model.eval()
+    # Build provider and dataset — dispatch on whether api_model is present
+    api_cfg = cfg.get("api_model", None)
+    batch_size = None
 
-    # Build dataset
-    _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
-    splits = [
-        DATASETS.build(cfg.data[s], default_args=dict(tokenizer=tokenizer))
-        for s in _split_names
-    ]
-    target_ids = splits[0].target_ids.to(device)
-    dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
-    n_classes = target_ids.shape[0]
+    if api_cfg is not None:
+        # Closed-source path: load only the tokenizer for prompt formatting
+        #tokenizer = _load_tokenizer_only(cfg)
+        _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
+        splits = [
+            DATASETS.build(cfg.data[s], default_args=dict(tokenizer=None))
+            for s in _split_names
+        ]
+        dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
+        n_classes = splits[0].n_labels
+        label_chars = splits[0].label_chars
+        provider = api_cfg.provider.lower()
+        if provider == "openai":
+            get_probs = _build_openai_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                use_logprobs=api_cfg.get("use_logprobs", False),
+                n_samples=api_cfg.get("n_samples", 30),
+            )
+        elif provider == "anthropic":
+            get_probs = _build_anthropic_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                n_samples=api_cfg.get("n_samples", 30),
+            )
+        else:
+            raise ValueError(f"Unknown api_model.provider '{provider}'.")
+        logger.info(f"API provider: {provider} / {api_cfg.model_name}")
+    else:
+        # Open-source path: load HuggingFace model + tokenizer
+        batch_size = cfg.train_cfg.per_device_eval_batch_size
+        tokenizer_run_cfg = dict(cfg.tokenizer_run_cfg)
+        logger.info(f"Batch size: {batch_size}")
+        logger.info(f"Tokenizer run config: {tokenizer_run_cfg}")
+
+        # Warn if the config would attach an untrained PEFT adapter
+        if cfg.model.get("use_peft") and cfg.model.get("peft_path") is None:
+            print(
+                "[martingale_property] WARNING: use_peft=True but peft_path is None. "
+                "An untrained LoRA adapter will be attached. "
+                "For zero-shot evaluation pass --cfg-options model.use_peft=False."
+            )
+
+        model, tokenizer = get_model_and_tokenizer(**cfg.model, device=device)
+        model.eval()
+        _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
+        splits = [
+            DATASETS.build(cfg.data[s], default_args=dict(tokenizer=tokenizer))
+            for s in _split_names
+        ]
+        target_ids = splits[0].target_ids.to(device)
+        dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
+        n_classes = target_ids.shape[0]
+        label_chars = splits[0].label_chars
+        get_probs = _build_hf_provider(model, tokenizer, target_ids, tokenizer_run_cfg, device)
+        logger.info(f"HuggingFace provider: {cfg.model.model_name_or_path}")
 
     logger.info(
         f"Dataset: {'+'.join(_split_names)}  "
@@ -432,17 +208,15 @@ def main():
     logger.info(f"Running martingale check: K={args.K} iterations ...")
 
     result = run_martingale_check(
-        model=model,
-        tokenizer=tokenizer,
+        get_probs=get_probs,
+        n_classes=n_classes,
         dataset=dataset,
-        target_ids=target_ids,
-        tokenizer_run_cfg=tokenizer_run_cfg,
-        device=device,
         K=args.K,
         n_samples=args.n_samples,
-        batch_size=batch_size,
+        batch_size=batch_size if batch_size else 1,
         rng=rng,
         logger=logger,
+        label_chars=label_chars,
     )
 
     metrics = compute_martingale_metrics(result["distributions"], result["true_labels"])
@@ -465,7 +239,7 @@ def main():
     )
     logger.info("=" * 60)
 
-    out_path = save_results(
+    out_path = save_martingale_results(
         work_dir=work_dir,
         seed=args.seed,
         K=args.K,

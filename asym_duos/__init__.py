@@ -17,6 +17,13 @@ from .utils import (
     optimize_weights_ts,
     save_predictions,
     setup_logger,
+    run_martingale_check,
+    compute_martingale_metrics,
+    save_martingale_results,
+    _load_tokenizer_only,
+    _build_hf_provider,
+    _build_openai_provider,
+    _build_anthropic_provider
 )
 
 __all__ = [
@@ -31,11 +38,16 @@ __all__ = [
     'optimize_laplace',
     'optimize_temperature_scaling',
     'optimize_weights',
-    # optimize_weights_blob is used by tools/postprocess_blob_asymduos.py
-    # to combine BLoB predictions produced by the bayesian-peft fork.
     'optimize_weights_blob',
     'optimize_weights_laplace',
     'optimize_weights_ts',
     'save_predictions',
     'setup_logger',
+    'run_martingale_check',
+    'compute_martingale_metrics',
+    'save_martingale_results',
+    '_load_tokenizer_only',
+    '_build_hf_provider',
+    '_build_openai_provider',
+    '_build_anthropic_provider'
 ]
