@@ -125,14 +125,6 @@ def main():
         if not cfg.api_model:
             cfg.train_cfg["per_device_eval_batch_size"] = 4
 
-    # Warn if the config would attach an untrained PEFT adapter
-    if cfg.model.get("use_peft") and cfg.model.get("peft_path") is None:
-        print(
-            "[martingale_property] WARNING: use_peft=True but peft_path is None. "
-            "An untrained LoRA adapter will be attached. "
-            "For zero-shot evaluation pass --cfg-options model.use_peft=False."
-        )
-
     work_dir = _build_work_dir(args.work_dir, args.config)
     mmengine.mkdir_or_exist(work_dir)
 
@@ -150,6 +142,7 @@ def main():
 
     # Build provider and dataset — dispatch on whether api_model is present
     api_cfg = cfg.get("api_model", None)
+    batch_size = None
 
     if api_cfg is not None:
         # Closed-source path: load only the tokenizer for prompt formatting
@@ -185,7 +178,15 @@ def main():
         tokenizer_run_cfg = dict(cfg.tokenizer_run_cfg)
         logger.info(f"Batch size: {batch_size}")
         logger.info(f"Tokenizer run config: {tokenizer_run_cfg}")
-        
+
+        # Warn if the config would attach an untrained PEFT adapter
+        if cfg.model.get("use_peft") and cfg.model.get("peft_path") is None:
+            print(
+                "[martingale_property] WARNING: use_peft=True but peft_path is None. "
+                "An untrained LoRA adapter will be attached. "
+                "For zero-shot evaluation pass --cfg-options model.use_peft=False."
+            )
+
         model, tokenizer = get_model_and_tokenizer(**cfg.model, device=device)
         model.eval()
         _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
@@ -196,6 +197,7 @@ def main():
         target_ids = splits[0].target_ids.to(device)
         dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
         n_classes = target_ids.shape[0]
+        label_chars = splits[0].label_chars
         get_probs = _build_hf_provider(model, tokenizer, target_ids, tokenizer_run_cfg, device)
         logger.info(f"HuggingFace provider: {cfg.model.model_name_or_path}")
 
@@ -211,9 +213,10 @@ def main():
         dataset=dataset,
         K=args.K,
         n_samples=args.n_samples,
-        batch_size=batch_size,
+        batch_size=batch_size if batch_size else 1,
         rng=rng,
         logger=logger,
+        label_chars=label_chars,
     )
 
     metrics = compute_martingale_metrics(result["distributions"], result["true_labels"])
