@@ -119,9 +119,11 @@ def main():
     if args.test_run:
         args.K = 3
         args.n_samples = 8
-        cfg.train_cfg["per_device_eval_batch_size"] = 4
         for s in (["train", "val", "test"] if args.split == "all" else [args.split]):
             cfg.data[s]["subset_size"] = 8
+        ## Reduce the batch_size for open source models
+        if not cfg.api_model:
+            cfg.train_cfg["per_device_eval_batch_size"] = 4
 
     # Warn if the config would attach an untrained PEFT adapter
     if cfg.model.get("use_peft") and cfg.model.get("peft_path") is None:
@@ -139,12 +141,10 @@ def main():
         filepath=osp.join(work_dir, f"{timestamp}.log"),
     )
     logger.info(f"Config:\n{'='*60}\n{cfg.pretty_text}\n{'='*60}")
-    batch_size = cfg.train_cfg.per_device_eval_batch_size
-    tokenizer_run_cfg = dict(cfg.tokenizer_run_cfg)
+
 
     logger.info(
         f"K={args.K}  n_samples={args.n_samples}  "
-        f"batch_size={batch_size}  max_length={tokenizer_run_cfg['max_length']}  "
         f"seed={args.seed}  split={args.split}"
     )
 
@@ -181,6 +181,11 @@ def main():
         logger.info(f"API provider: {provider} / {api_cfg.model_name}")
     else:
         # Open-source path: load HuggingFace model + tokenizer
+        batch_size = cfg.train_cfg.per_device_eval_batch_size
+        tokenizer_run_cfg = dict(cfg.tokenizer_run_cfg)
+        logger.info(f"Batch size: {batch_size}")
+        logger.info(f"Tokenizer run config: {tokenizer_run_cfg}")
+        
         model, tokenizer = get_model_and_tokenizer(**cfg.model, device=device)
         model.eval()
         _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
