@@ -1,10 +1,11 @@
-from typing import Callable, List, Optional
-
 import torch
 import numpy as np
 import torch.nn.functional as F
 import openai
 import anthropic
+
+from typing import Callable, List
+from openai import PermissionDeniedError
 
 def _build_hf_provider(
     model,
@@ -40,13 +41,20 @@ def _build_openai_provider(
         probs = np.zeros((len(prompts), n_classes), dtype=np.float32)
         for i, prompt in enumerate(prompts):
             if use_logprobs:
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=1,
-                    logprobs=True,
-                    top_logprobs=20,
-                )
+                try:
+                    resp = client.chat.completions.create(
+                        model=model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=1,
+                        logprobs=True,
+                        top_logprobs=20,
+                    )
+                except PermissionDeniedError as e:
+                    print("status_code:", getattr(e, "status_code", None))
+                    print("message:", str(e))
+                    print("body:", getattr(e, "body", None))
+                    raise
+
                 top = resp.choices[0].logprobs.content[0].top_logprobs
                 log_p = {t.token.strip(): t.logprob for t in top}
                 raw = np.array(
@@ -57,12 +65,19 @@ def _build_openai_provider(
             else:
                 counts = np.zeros(n_classes, dtype=np.float64)
                 for _ in range(n_samples):
-                    resp = client.chat.completions.create(
-                        model=model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=1,
-                        temperature=1.0,
-                    )
+                    try:
+                        resp = client.chat.completions.create(
+                            model=model_name,
+                            messages=[{"role": "user", "content": prompt}],
+                            max_tokens=1,
+                            temperature=1.0,
+                        )
+                    except PermissionDeniedError as e:
+                        print("status_code:", getattr(e, "status_code", None))
+                        print("message:", str(e))
+                        print("body:", getattr(e, "body", None))
+                        raise
+
                     ans = resp.choices[0].message.content.strip().upper()
                     if ans in label_chars:
                         counts[label_chars.index(ans)] += 1
