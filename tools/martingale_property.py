@@ -49,6 +49,7 @@ from asym_duos import (
      _build_hf_provider,
      _build_openai_provider,
      _build_anthropic_provider,
+     _build_deepseek_provider,
      run_martingale_check,
      compute_martingale_metrics,
      save_martingale_results
@@ -171,6 +172,13 @@ def main():
             get_probs = _build_anthropic_provider(
                 model_name=api_cfg.model_name,
                 label_chars=label_chars,
+                n_api_samples=n_api_samples,
+            )
+        elif provider == 'deepseek':
+            get_probs = _build_deepseek_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                use_logprobs=api_cfg.get("use_logprobs", False),
                 n_api_samples=n_api_samples,
             )
         else:
