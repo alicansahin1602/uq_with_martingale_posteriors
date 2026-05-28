@@ -55,8 +55,7 @@ from asym_duos import (
      save_martingale_results
 )
 import os
-from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -153,11 +152,11 @@ def main():
 
     if api_cfg is not None:
         ## Load the api keys
-        env_files = list(Path().resolve().parent.glob('*.env'))
-        if env_files:
-            load_dotenv(env_files[0])
+        env_file = find_dotenv(usecwd=True)
+        if env_file:
+            load_dotenv(env_file)
         else:
-            logger.warning("No .env file found in root directory; API keys must be set in the environment.")
+            logger.warning("No .env file found; API keys must be set in the environment.")
         # Closed-source path: load only the tokenizer for prompt formatting
         #tokenizer = _load_tokenizer_only(cfg)
         _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
