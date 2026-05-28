@@ -2,4 +2,4 @@ api_model:
     provider: "openai"
     model_name: "gpt-4o"
     use_logprobs: true
-    n_samples: null
+    n_api_samples: null
