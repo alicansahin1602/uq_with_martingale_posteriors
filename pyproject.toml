@@ -36,6 +36,7 @@ dependencies = [
     # --- API providers ---
     "openai>=1.0.0",
     "anthropic>=0.20.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
