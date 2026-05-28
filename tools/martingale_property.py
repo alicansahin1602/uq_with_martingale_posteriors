@@ -28,7 +28,7 @@ formatting; model weights are not loaded when `api_model` is present.
         provider: openai          # openai | anthropic
         model_name: gpt-4o
         use_logprobs: true        # OpenAI only; false falls back to sampling
-        n_samples: 30             # samples per prompt (sampling mode / Anthropic)
+        n_api_samples: 30         # API calls per prompt for probability estimation (sampling mode / Anthropic)
 
 Set OPENAI_API_KEY or ANTHROPIC_API_KEY in the environment before running.
 """
@@ -74,6 +74,9 @@ def parse_args():
                    help="Number of iterative feedback steps (depth of the chain).")
     p.add_argument("--n-samples", type=int, default=None,
                    help="Number of questions to evaluate (None = full split).")
+    p.add_argument("--n-api-samples", type=int, default=None,
+                   help="API calls per prompt for probability estimation when use_logprobs=False "
+                        "(overrides api_model.n_api_samples in config; default: 30).")
     p.add_argument("--split", default="test",
                    choices=["train", "val", "test", "all"],
                    help="Dataset split to evaluate on. 'all' concatenates train+val+test.")
@@ -156,18 +159,19 @@ def main():
         n_classes = splits[0].n_labels
         label_chars = splits[0].label_chars
         provider = api_cfg.provider.lower()
+        n_api_samples = args.n_api_samples or api_cfg.get("n_api_samples", 30)
         if provider == "openai":
             get_probs = _build_openai_provider(
                 model_name=api_cfg.model_name,
                 label_chars=label_chars,
                 use_logprobs=api_cfg.get("use_logprobs", False),
-                n_samples=api_cfg.get("n_samples", 30),
+                n_api_samples=n_api_samples,
             )
         elif provider == "anthropic":
             get_probs = _build_anthropic_provider(
                 model_name=api_cfg.model_name,
                 label_chars=label_chars,
-                n_samples=api_cfg.get("n_samples", 30),
+                n_api_samples=n_api_samples,
             )
         else:
             raise ValueError(f"Unknown api_model.provider '{provider}'.")

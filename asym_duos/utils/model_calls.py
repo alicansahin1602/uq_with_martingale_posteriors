@@ -26,12 +26,12 @@ def _build_openai_provider(
     model_name: str,
     label_chars: List[str],
     use_logprobs: bool,
-    n_samples: int,
+    n_api_samples: int,
 ) -> Callable[[List[str]], np.ndarray]:
     """OpenAI provider.
 
     use_logprobs=True  — one API call per prompt using top_logprobs (fast, exact).
-    use_logprobs=False — n_samples calls per prompt using temperature sampling.
+    use_logprobs=False — n_api_samples calls per prompt using temperature sampling.
     """
 
     client = openai.OpenAI()
@@ -64,7 +64,7 @@ def _build_openai_provider(
                 probs[i] = (raw / raw.sum()).astype(np.float32)
             else:
                 counts = np.zeros(n_classes, dtype=np.float64)
-                for _ in range(n_samples):
+                for _ in range(n_api_samples):
                     try:
                         resp = client.chat.completions.create(
                             model=model_name,
@@ -93,7 +93,7 @@ def _build_openai_provider(
 def _build_anthropic_provider(
     model_name: str,
     label_chars: List[str],
-    n_samples: int,
+    n_api_samples: int,
 ) -> Callable[[List[str]], np.ndarray]:
     """Anthropic provider: sampling-based (no logprob API available)."""
     client = anthropic.Anthropic()
@@ -103,7 +103,7 @@ def _build_anthropic_provider(
         probs = np.zeros((len(prompts), n_classes), dtype=np.float32)
         for i, prompt in enumerate(prompts):
             counts = np.zeros(n_classes, dtype=np.float64)
-            for _ in range(n_samples):
+            for _ in range(n_api_samples):
                 resp = client.messages.create(
                     model=model_name,
                     max_tokens=1,

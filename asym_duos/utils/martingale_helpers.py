@@ -85,24 +85,27 @@ def run_martingale_check(
     """
     N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
 
+    # Draw N random indices without replacement for reproducibility via rng
+    selected_indices = rng.choice(len(dataset), size=N, replace=False)
+
     distributions = np.zeros((N, K + 1, n_classes), dtype=np.float32)
     true_labels = np.zeros(N, dtype=np.int32)
     input_texts: List[str] = []
 
     # Build initial prompts and collect ground-truth labels
     initial_prompts: List[str] = []
-    for i in range(N):
-        sample = dataset[i]
+    for i, dataset_idx in enumerate(selected_indices):
+        sample = dataset[int(dataset_idx)]
         initial_prompts.append(sample["prompt"])
         true_labels[i] = int(sample["label"])
         input_texts.append(sample["prompt"])
 
-    # Row ids (best-effort; fall back to positional indices)
+    # Row ids (best-effort; fall back to selected dataset indices)
     try:
         all_row_ids = dataset.get_data_indices()
-        data_indices = np.array([all_row_ids[i] for i in range(N)], dtype=np.int32)
+        data_indices = np.array([all_row_ids[int(idx)] for idx in selected_indices], dtype=np.int32)
     except Exception:
-        data_indices = np.arange(N, dtype=np.int32)
+        data_indices = selected_indices.astype(np.int32)
 
     # Per-question answer history accumulated across iterations
     history: List[List[str]] = [[] for _ in range(N)]
