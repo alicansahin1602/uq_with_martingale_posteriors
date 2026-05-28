@@ -6,6 +6,7 @@ import anthropic
 
 from typing import Callable, List
 from openai import PermissionDeniedError
+from martingale_helpers import mcqa_system_prompt
 
 def _build_hf_provider(
     model,
@@ -45,8 +46,15 @@ def _build_openai_provider(
                 try:
                     resp = client.chat.completions.create(
                         model=model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=1,
+                        messages=[{
+                            "role": "system",
+                            "content": mcqa_system_prompt(n_classes)
+                        }, {
+                            "role": "user",
+                            "content": prompt
+                        }],
+                        extra_body={"thinking": {"type": "disabled"}},
+                        max_tokens=1024,
                         logprobs=True,
                         top_logprobs=20,
                     )
@@ -69,9 +77,17 @@ def _build_openai_provider(
                     try:
                         resp = client.chat.completions.create(
                             model=model_name,
-                            messages=[{"role": "user", "content": prompt}],
-                            max_tokens=1,
-                            temperature=1.0,
+                            messages=[{
+                                "role": "system",
+                                "content": mcqa_system_prompt(n_classes)
+                            }, {
+                                "role": "user",
+                                "content": prompt
+                            }],
+                            extra_body={"thinking": {"type": "disabled"}},
+                            max_tokens=1024,
+                            logprobs=True,
+                            top_logprobs=20,
                         )
                     except PermissionDeniedError as e:
                         print("status_code:", getattr(e, "status_code", None))
@@ -108,7 +124,9 @@ def _build_anthropic_provider(
             for _ in range(n_api_samples):
                 resp = client.messages.create(
                     model=model_name,
-                    max_tokens=1,
+                    max_tokens=1024,
+                    thinking={"type": "disabled"},
+                    system=mcqa_system_prompt(n_classes),
                     messages=[{"role": "user", "content": prompt}],
                 )
                 ans = resp.content[0].text.strip().upper()
@@ -129,6 +147,7 @@ def _build_deepseek_provider(
     n_api_samples: int,
     api: str = None,
 ) -> Callable[[List[str]], np.ndarray]:
+    
     """DeepSeek provider.
 
     use_logprobs=True  — one API call per prompt using top_logprobs (fast, exact).
@@ -145,8 +164,15 @@ def _build_deepseek_provider(
                 try:
                     resp = client.chat.completions.create(
                         model=model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=1,
+                        messages=[{
+                            "role": "system",
+                            "content": mcqa_system_prompt(n_classes)
+                        }, {
+                            "role": "user",
+                            "content": prompt
+                        }],
+                        extra_body={"thinking": {"type": "disabled"}},
+                        max_tokens=1024,
                         logprobs=True,
                         top_logprobs=20,
                     )
@@ -169,9 +195,17 @@ def _build_deepseek_provider(
                     try:
                         resp = client.chat.completions.create(
                             model=model_name,
-                            messages=[{"role": "user", "content": prompt}],
-                            max_tokens=1,
-                            temperature=1.0,
+                            messages=[{
+                                "role": "system",
+                                "content": mcqa_system_prompt(n_classes)
+                            }, {
+                                "role": "user",
+                                "content": prompt
+                            }],
+                            extra_body={"thinking": {"type": "disabled"}},
+                            max_tokens=1024,
+                            logprobs=True,
+                            top_logprobs=20,
                         )
                     except PermissionDeniedError as e:
                         print("status_code:", getattr(e, "status_code", None))
