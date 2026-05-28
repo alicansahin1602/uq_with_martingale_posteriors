@@ -27,6 +27,7 @@ def _build_openai_provider(
     label_chars: List[str],
     use_logprobs: bool,
     n_api_samples: int,
+    api: str = None,
 ) -> Callable[[List[str]], np.ndarray]:
     """OpenAI provider.
 
@@ -34,7 +35,7 @@ def _build_openai_provider(
     use_logprobs=False — n_api_samples calls per prompt using temperature sampling.
     """
 
-    client = openai.OpenAI()
+    client = openai.OpenAI(api_key=api)
     n_classes = len(label_chars)
 
     def get_probs(prompts: List[str]) -> np.ndarray:
@@ -94,9 +95,10 @@ def _build_anthropic_provider(
     model_name: str,
     label_chars: List[str],
     n_api_samples: int,
+    api: str = None,
 ) -> Callable[[List[str]], np.ndarray]:
     """Anthropic provider: sampling-based (no logprob API available)."""
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(api_key=api)
     n_classes = len(label_chars)
 
     def get_probs(prompts: List[str]) -> np.ndarray:
@@ -125,6 +127,7 @@ def _build_deepseek_provider(
     label_chars: List[str],
     use_logprobs: bool,
     n_api_samples: int,
+    api: str = None,
 ) -> Callable[[List[str]], np.ndarray]:
     """DeepSeek provider.
 
@@ -132,7 +135,7 @@ def _build_deepseek_provider(
     use_logprobs=False — n_api_samples calls per prompt using temperature sampling.
     """
 
-    client = openai.OpenAI(base_url="https://api.deepseek.com")
+    client = openai.OpenAI(api_key=api, base_url="https://api.deepseek.com")
     n_classes = len(label_chars)
 
     def get_probs(prompts: List[str]) -> np.ndarray:
