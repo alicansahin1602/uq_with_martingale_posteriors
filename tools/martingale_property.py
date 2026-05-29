@@ -49,10 +49,13 @@ from asym_duos import (
      _build_hf_provider,
      _build_openai_provider,
      _build_anthropic_provider,
+     _build_deepseek_provider,
      run_martingale_check,
      compute_martingale_metrics,
      save_martingale_results
 )
+import os
+from dotenv import load_dotenv, find_dotenv
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -148,6 +151,12 @@ def main():
     batch_size = None
 
     if api_cfg is not None:
+        ## Load the api keys
+        env_file = find_dotenv(usecwd=True)
+        if env_file:
+            load_dotenv(env_file)
+        else:
+            logger.warning("No .env file found; API keys must be set in the environment.")
         # Closed-source path: load only the tokenizer for prompt formatting
         #tokenizer = _load_tokenizer_only(cfg)
         _split_names = ["train", "val", "test"] if args.split == "all" else [args.split]
@@ -166,12 +175,22 @@ def main():
                 label_chars=label_chars,
                 use_logprobs=api_cfg.get("use_logprobs", False),
                 n_api_samples=n_api_samples,
+                api = os.getenv("OPENAI_API_KEY"),
             )
         elif provider == "anthropic":
             get_probs = _build_anthropic_provider(
                 model_name=api_cfg.model_name,
                 label_chars=label_chars,
                 n_api_samples=n_api_samples,
+                api = os.getenv("ANTHROPIC_API_KEY"),
+            )
+        elif provider == 'deepseek':
+            get_probs = _build_deepseek_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                use_logprobs=api_cfg.get("use_logprobs", False),
+                n_api_samples=n_api_samples,
+                api = os.getenv("DEEPSEEK_API_KEY"),
             )
         else:
             raise ValueError(f"Unknown api_model.provider '{provider}'.")

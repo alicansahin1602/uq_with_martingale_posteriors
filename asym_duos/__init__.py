@@ -23,7 +23,8 @@ from .utils import (
     _load_tokenizer_only,
     _build_hf_provider,
     _build_openai_provider,
-    _build_anthropic_provider
+    _build_anthropic_provider,
+    _build_deepseek_provider
 )
 
 __all__ = [
@@ -49,5 +50,6 @@ __all__ = [
     '_load_tokenizer_only',
     '_build_hf_provider',
     '_build_openai_provider',
-    '_build_anthropic_provider'
+    '_build_anthropic_provider',
+    '_build_deepseek_provider'
 ]
