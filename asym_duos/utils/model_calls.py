@@ -6,7 +6,7 @@ import anthropic
 
 from typing import Callable, List
 from openai import PermissionDeniedError
-from martingale_helpers import mcqa_system_prompt
+from .system_prompt import mcqa_system_prompt
 
 def _build_hf_provider(
     model,
