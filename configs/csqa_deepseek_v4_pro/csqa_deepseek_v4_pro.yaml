@@ -1,0 +1,4 @@
+_base_: ['../_base_/csqa.yaml', '../_base_/deepseek_v4_pro.yaml', '../_base_/misc.yaml']
+
+process_preds:
+    npz_file: "csqa.npz"

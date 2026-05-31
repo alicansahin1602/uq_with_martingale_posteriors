@@ -1,0 +1,4 @@
+_base_: ['../_base_/arc_e.yaml', '../_base_/deepseek_v4_pro.yaml', '../_base_/misc.yaml']
+
+process_preds:
+    npz_file: "arc_e.npz"
