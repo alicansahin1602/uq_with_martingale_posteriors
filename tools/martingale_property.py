@@ -141,7 +141,7 @@ def main():
         for s in (["train", "val", "test"] if args.split == "all" else [args.split]):
             cfg.data[s]["subset_size"] = 8
         ## Reduce the batch_size for open source models
-        if not cfg.api_model:
+        if not cfg.get("api_model", None):
             cfg.train_cfg["per_device_eval_batch_size"] = 4
 
     work_dir = _build_work_dir(args.work_dir, args.config)
