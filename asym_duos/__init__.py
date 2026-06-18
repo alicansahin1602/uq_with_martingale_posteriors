@@ -24,7 +24,15 @@ from .utils import (
     _build_hf_provider,
     _build_openai_provider,
     _build_anthropic_provider,
-    _build_deepseek_provider
+    _build_deepseek_provider,
+    _build_ppr_hf_provider,
+    _build_ppr_openai_provider,
+    _build_ppr_anthropic_provider,
+    _build_ppr_deepseek_provider,
+    _parse_ppr_response,
+    run_ppr_check,
+    compute_emd_metrics,
+    ppr_system_prompt,
 )
 
 __all__ = [
@@ -51,5 +59,13 @@ __all__ = [
     '_build_hf_provider',
     '_build_openai_provider',
     '_build_anthropic_provider',
-    '_build_deepseek_provider'
+    '_build_deepseek_provider',
+    '_build_ppr_hf_provider',
+    '_build_ppr_openai_provider',
+    '_build_ppr_anthropic_provider',
+    '_build_ppr_deepseek_provider',
+    '_parse_ppr_response',
+    'run_ppr_check',
+    'compute_emd_metrics',
+    'ppr_system_prompt',
 ]

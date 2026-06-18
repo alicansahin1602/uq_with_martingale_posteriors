@@ -43,16 +43,22 @@ import torch
 from torch.utils.data import ConcatDataset
 from mmengine.runner.utils import set_random_seed
 from asym_duos import (
-     DATASETS, 
-     get_model_and_tokenizer, 
+     DATASETS,
+     get_model_and_tokenizer,
      setup_logger,
      _build_hf_provider,
      _build_openai_provider,
      _build_anthropic_provider,
      _build_deepseek_provider,
+     _build_ppr_hf_provider,
+     _build_ppr_openai_provider,
+     _build_ppr_anthropic_provider,
+     _build_ppr_deepseek_provider,
      run_martingale_check,
      compute_martingale_metrics,
-     save_martingale_results
+     save_martingale_results,
+     run_ppr_check,
+     compute_emd_metrics,
 )
 import os
 from dotenv import load_dotenv, find_dotenv
@@ -86,6 +92,13 @@ def parse_args():
     # Config overrides
     p.add_argument("--cfg-options", "-o", nargs="+", action=mmengine.DictAction,
                    help="Override config values, e.g. model.use_peft=False.")
+
+    # PPR mode
+    p.add_argument("--mode", default="iterative", choices=["iterative", "ppr"],
+                   help="'iterative': one call per step (existing); "
+                        "'ppr': single call generates N i.i.d. samples (PPR).")
+    p.add_argument("--n-ppr-samples", type=int, default=100,
+                   help="Number of i.i.d. answers generated per PPR call (default 100).")
 
     # Quick test
     p.add_argument("--test-run", action="store_true",
@@ -169,32 +182,62 @@ def main():
         label_chars = splits[0].label_chars
         provider = api_cfg.provider.lower()
         n_api_samples = args.n_api_samples or api_cfg.get("n_api_samples", 30)
-        if provider == "openai":
-            get_probs = _build_openai_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                use_logprobs=api_cfg.get("use_logprobs", False),
-                n_api_samples=n_api_samples,
-                api = os.getenv("OPENAI_API_KEY"),
-            )
-        elif provider == "anthropic":
-            get_probs = _build_anthropic_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                n_api_samples=n_api_samples,
-                api = os.getenv("ANTHROPIC_API_KEY"),
-            )
-        elif provider == 'deepseek':
-            get_probs = _build_deepseek_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                use_logprobs=api_cfg.get("use_logprobs", False),
-                n_api_samples=n_api_samples,
-                api = os.getenv("DEEPSEEK_API_KEY"),
+        n_ppr_samples = args.n_ppr_samples
+        if args.mode == "ppr":
+            if provider == "openai":
+                get_probs = _build_ppr_openai_provider(
+                    model_name=api_cfg.model_name,
+                    label_chars=label_chars,
+                    n_ppr_samples=n_ppr_samples,
+                    api=os.getenv("OPENAI_API_KEY"),
+                )
+            elif provider == "anthropic":
+                get_probs = _build_ppr_anthropic_provider(
+                    model_name=api_cfg.model_name,
+                    label_chars=label_chars,
+                    n_ppr_samples=n_ppr_samples,
+                    api=os.getenv("ANTHROPIC_API_KEY"),
+                )
+            elif provider == "deepseek":
+                get_probs = _build_ppr_deepseek_provider(
+                    model_name=api_cfg.model_name,
+                    label_chars=label_chars,
+                    n_ppr_samples=n_ppr_samples,
+                    api=os.getenv("DEEPSEEK_API_KEY"),
+                )
+            else:
+                raise ValueError(f"Unknown api_model.provider '{provider}'.")
+            logger.info(
+                f"PPR provider: {provider} / {api_cfg.model_name}  "
+                f"n_ppr_samples={n_ppr_samples}"
             )
         else:
-            raise ValueError(f"Unknown api_model.provider '{provider}'.")
-        logger.info(f"API provider: {provider} / {api_cfg.model_name}")
+            if provider == "openai":
+                get_probs = _build_openai_provider(
+                    model_name=api_cfg.model_name,
+                    label_chars=label_chars,
+                    use_logprobs=api_cfg.get("use_logprobs", False),
+                    n_api_samples=n_api_samples,
+                    api=os.getenv("OPENAI_API_KEY"),
+                )
+            elif provider == "anthropic":
+                get_probs = _build_anthropic_provider(
+                    model_name=api_cfg.model_name,
+                    label_chars=label_chars,
+                    n_api_samples=n_api_samples,
+                    api=os.getenv("ANTHROPIC_API_KEY"),
+                )
+            elif provider == "deepseek":
+                get_probs = _build_deepseek_provider(
+                    model_name=api_cfg.model_name,
+                    label_chars=label_chars,
+                    use_logprobs=api_cfg.get("use_logprobs", False),
+                    n_api_samples=n_api_samples,
+                    api=os.getenv("DEEPSEEK_API_KEY"),
+                )
+            else:
+                raise ValueError(f"Unknown api_model.provider '{provider}'.")
+            logger.info(f"API provider: {provider} / {api_cfg.model_name}")
     else:
         # Open-source path: load HuggingFace model + tokenizer
         batch_size = cfg.train_cfg.per_device_eval_batch_size
@@ -221,33 +264,56 @@ def main():
         dataset = ConcatDataset(splits) if len(splits) > 1 else splits[0]
         n_classes = target_ids.shape[0]
         label_chars = splits[0].label_chars
-        get_probs = _build_hf_provider(model, tokenizer, target_ids, tokenizer_run_cfg, device)
-        logger.info(f"HuggingFace provider: {cfg.model.model_name_or_path}")
+        n_ppr_samples = args.n_ppr_samples
+        if args.mode == "ppr":
+            get_probs = _build_ppr_hf_provider(
+                model, tokenizer, label_chars, n_ppr_samples, device
+            )
+            logger.info(
+                f"PPR HuggingFace provider: {cfg.model.model_name_or_path}  "
+                f"n_ppr_samples={n_ppr_samples}"
+            )
+        else:
+            get_probs = _build_hf_provider(model, tokenizer, target_ids, tokenizer_run_cfg, device)
+            logger.info(f"HuggingFace provider: {cfg.model.model_name_or_path}")
 
     logger.info(
         f"Dataset: {'+'.join(_split_names)}  "
         f"size={len(dataset)}  n_classes={n_classes}"
     )
-    logger.info(f"Running martingale check: K={args.K} iterations ...")
+    logger.info(f"Running {args.mode} check: K={args.K} iterations ...")
 
-    result = run_martingale_check(
-        get_probs=get_probs,
-        n_classes=n_classes,
-        dataset=dataset,
-        K=args.K,
-        n_samples=args.n_samples,
-        batch_size=batch_size if batch_size else 1,
-        rng=rng,
-        logger=logger,
-        label_chars=label_chars,
-    )
+    if args.mode == "ppr":
+        result = run_ppr_check(
+            get_probs=get_probs,
+            n_classes=n_classes,
+            dataset=dataset,
+            K=args.K,
+            n_samples=args.n_samples,
+            rng=rng,
+            logger=logger,
+            label_chars=label_chars,
+            n_ppr_samples=args.n_ppr_samples,
+        )
+    else:
+        result = run_martingale_check(
+            get_probs=get_probs,
+            n_classes=n_classes,
+            dataset=dataset,
+            K=args.K,
+            n_samples=args.n_samples,
+            batch_size=batch_size if batch_size else 1,
+            rng=rng,
+            logger=logger,
+            label_chars=label_chars,
+        )
 
     metrics = compute_martingale_metrics(result["distributions"], result["true_labels"])
 
     # Log summary
     N = result["distributions"].shape[0]
     logger.info("=" * 60)
-    logger.info("Martingale Property Check — Summary")
+    logger.info(f"Martingale Property Check ({args.mode.upper()}) — Summary")
     logger.info(f"  Questions evaluated : {N}")
     logger.info(f"  Iterations (K)      : {args.K}")
     logger.info(f"  Accuracy at p0      : {metrics['accuracy_at_p0']:.4f}")
@@ -260,6 +326,14 @@ def main():
         f"  Drift profile (k=1..{args.K}): "
         + np.array2string(metrics["drift_profile"], precision=4, separator=", ")
     )
+    if args.mode == "ppr":
+        emd_metrics = compute_emd_metrics(result["distributions"])
+        metrics.update(emd_metrics)
+        logger.info(f"  EMD                 : {emd_metrics['emd']:.4f}")
+        logger.info(
+            f"  EMD profile (k=1..{args.K}): "
+            + np.array2string(emd_metrics["emd_profile"], precision=4, separator=", ")
+        )
     logger.info("=" * 60)
 
     out_path = save_martingale_results(
