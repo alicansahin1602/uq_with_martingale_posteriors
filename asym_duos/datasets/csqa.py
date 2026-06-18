@@ -28,7 +28,7 @@ class CSQADataset(ClassificationDataset):
         subset_size: Optional[int] = None,
         noisy_level: Optional[float] = None,
     ) -> None:
-        data_set = load_dataset('commonsense_qa', **dataset_cfg)
+        data_set = load_dataset('tau/commonsense_qa', **dataset_cfg)
 
         if subset_size is not None:
             data_set = data_set.select(range(subset_size))
