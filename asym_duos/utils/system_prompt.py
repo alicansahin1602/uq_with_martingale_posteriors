@@ -9,6 +9,65 @@ def _label_sequence(n_class: int) -> List[str]:
     return list(string.ascii_uppercase[:n_class])
 
 
+def ppr_system_prompt(n_class: int, N: int = 100) -> str:
+    """Build the PPR system prompt that instructs the model to generate N i.i.d. samples.
+
+    The model outputs N answer letters separated by newlines in a single call.
+    Empirical frequencies of those letters estimate the predictive distribution.
+
+    Parameters
+    ----------
+    n_class : int
+        Number of answer choices (1–26).
+    N : int
+        Number of i.i.d. samples to generate (default 100).
+    """
+    labels = _label_sequence(n_class)
+    choice_str = ", ".join(labels)
+    return f"""\
+## Task
+You are an expert in multiple-choice QA.
+Return **a list of answer choices** among ({choice_str}) for the given question below.
+
+### Output Format
+- Your output must start immediately with a single letter among ({choice_str}).
+- Your separator is a single newline(\\n).
+- \\n must appear **only once** after each choice.
+- Spaces, additional \\n, and punctuations (periods and commas) are STRICTLY NOT ALLOWED.
+- You must output total {N} letters.
+- You must generate **a list of answer choices** by following the generation rules below.
+
+### Generation Rule
+You are generating a **random sample** from your probability distribution for each choice being the answer for a given question.
+Follow the steps.
+(STEP 1) First, assign probability weight on each choice being an answer.
+        - If a choice is likely to be an answer, it must have higher probability.
+        - Conversely, if a choice is more likely to be a wrong answer, then it must have lower probability.
+        - You are allowed to give a trivial probability distribution for the choices,
+        if and only if you're certain of the answer choice.
+        (i.e. multinomial distribution on {n_class}-dim answer choices.)
+
+(STEP 2) Write down each line.
+        Each line is a single alphabet sampled from your predictive distribution from STEP 1.
+        (If you assigned zero probability weight for some choices, it MUST NOT BE SAMPLED!)
+        - Line 1 = a single alphabet sampled from ({choice_str}) with **your probability weight**.
+        - Line $i$ ($2 <= i <= {N}$) = a single alphabet independently sampled from ({choice_str}) with **your probability weight**.
+        - You must not condition on your previous (Line 1 ~ $i-1$) answers.
+        Your answer must be an i.i.d. sample from your distribution.
+
+#### Generation examples
+* If you think D is the answer for given question with 100% probability, then output might be :
+D\\nD\\nD\\nD\\nD\\nD ...
+* If you think B is the most plausible answer, but E can might also be an answer with small probability,
+then output might be: B\\nB\\nB\\nB\\nE\\nB ...
+* If you think either both A or C can be an answer with high probability, and the others(B, D, E, etc.) cannot
+be the answer, then output might be : C\\nA\\nC\\nC\\nA\\nA\\n ... or A\\nC\\nC\\nA\\nA\\nC\\n ...
+
+Now, generate the {N}-line answer list for the given question below.
+You must follow the output format and the generating rules!\
+"""
+
+
 def mcqa_system_prompt(n_class: int) -> str:
     """Build a system prompt for a multiple-choice question-answering assistant.
 

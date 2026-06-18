@@ -8,6 +8,23 @@ import os.path as osp
 
 _ANSWER_SUFFIX = "\nAnswer:"
 
+
+def _strip_answer_suffix(prompt: str) -> str:
+    """Remove trailing '\\nAnswer:' from a prompt so it can be fed to a PPR provider."""
+    if prompt.endswith(_ANSWER_SUFFIX):
+        return prompt[: -len(_ANSWER_SUFFIX)]
+    return prompt
+
+
+def _insert_prev_answers_ppr(prompt_body: str, prev_labels: List[str]) -> str:
+    """Prepend seed answers to a PPR prompt body (Answer: suffix already stripped).
+
+    Adds a line of the form 'Previously sampled answers: A, B, A, ...' before
+    the final newline so the model can use them as a warm-start signal.
+    """
+    history = ", ".join(prev_labels)
+    return f"{prompt_body}\nPreviously sampled answers: {history}"
+
 def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
     """Splice the answer history into a prompt just before 'Answer:'.
 
@@ -242,3 +259,116 @@ def save_martingale_results(
     np.savez_compressed(out_path, **existing)
     logger.info(f"Results saved to {out_path}")
     return out_path
+
+
+def run_ppr_check(
+    get_probs: Callable[[List[str]], np.ndarray],
+    n_classes: int,
+    dataset,
+    K: int,
+    n_samples: Optional[int],
+    rng: np.random.Generator,
+    logger,
+    label_chars: list,
+    n_ppr_samples: int = 100,
+) -> dict:
+    """PPR variant of the martingale check.
+
+    At each step k the PPR provider generates n_ppr_samples answers in a single
+    call and returns their empirical frequency as the distribution estimate.
+    Between steps, n_ppr_samples seed answers sampled from the previous
+    distribution are prepended to the question to accelerate convergence.
+
+    Prompts passed to get_probs have their trailing '\\nAnswer:' stripped;
+    after step 0 they additionally carry a 'Previously sampled answers:' line.
+
+    Returns
+    -------
+    dict with keys:
+        distributions  (N, K+1, C)
+        true_labels    (N,)
+        input_texts    list[str]   -- raw initial prompts (with Answer: suffix)
+        data_indices   (N,)
+        prompt_history (N, K+1)   -- exact prompt fed to get_probs at each step
+    """
+    N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
+    selected_indices = rng.choice(len(dataset), size=N, replace=False)
+
+    distributions = np.zeros((N, K + 1, n_classes), dtype=np.float32)
+    true_labels = np.zeros(N, dtype=np.int32)
+    input_texts: List[str] = []
+    initial_prompts: List[str] = []
+
+    for i, dataset_idx in enumerate(selected_indices):
+        sample = dataset[int(dataset_idx)]
+        input_texts.append(sample["prompt"])
+        true_labels[i] = int(sample["label"])
+        initial_prompts.append(_strip_answer_suffix(sample["prompt"]))
+
+    try:
+        all_row_ids = dataset.get_data_indices()
+        data_indices = np.array(
+            [all_row_ids[int(idx)] for idx in selected_indices], dtype=np.int32
+        )
+    except Exception:
+        data_indices = selected_indices.astype(np.int32)
+
+    current_prompts = list(initial_prompts)
+    all_prompts: List[List[str]] = []
+
+    for k in range(K + 1):
+        all_prompts.append(list(current_prompts))
+        logger.info(f"  PPR iteration k={k}/{K} ...")
+        probs_k = get_probs(current_prompts)
+        distributions[:, k, :] = probs_k
+
+        if k < K:
+            next_prompts: List[str] = []
+            for i in range(N):
+                p = probs_k[i].astype(np.float64)
+                p /= p.sum()
+                seed_indices = rng.choice(n_classes, size=n_ppr_samples, p=p)
+                seeds = [label_chars[idx] for idx in seed_indices]
+                next_prompts.append(
+                    _insert_prev_answers_ppr(initial_prompts[i], seeds)
+                )
+            current_prompts = next_prompts
+
+    prompt_history = np.array(all_prompts, dtype=object).T  # (N, K+1)
+
+    return {
+        "distributions": distributions,
+        "true_labels": true_labels,
+        "input_texts": input_texts,
+        "data_indices": data_indices,
+        "prompt_history": prompt_history,
+    }
+
+
+def compute_emd_metrics(distributions: np.ndarray) -> dict:
+    """Compute Expected Martingale Drift (EMD) from a PPR distribution trajectory.
+
+    EMD = (1/K) * sum_{k=1}^{K} E[TV(p^(k), p^(0))]
+
+    where p^(0) is the unseeded distribution and p^(k) for k>=1 are the
+    seeded estimates.  A value near 0 means the distribution stabilises
+    immediately; larger values indicate burn-in drift.
+
+    Parameters
+    ----------
+    distributions : (N, K+1, C)  — output of run_ppr_check
+
+    Returns
+    -------
+    dict with scalar 'emd' and per-step array 'emd_profile' (length K).
+    """
+    p0 = distributions[:, 0:1, :]          # (N, 1, C)  — broadcast anchor
+    p_rest = distributions[:, 1:, :]       # (N, K, C)
+    # TV distance per question per step
+    tv = 0.5 * np.abs(p_rest - p0).sum(axis=-1)  # (N, K)
+    emd_profile = tv.mean(axis=0)                  # (K,)
+    emd = float(emd_profile.mean())
+    return {
+        "emd": emd,
+        "emd_profile": emd_profile,
+    }
