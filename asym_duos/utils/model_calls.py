@@ -270,11 +270,14 @@ def _build_ppr_hf_provider(
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
             ]
-            input_ids = tokenizer.apply_chat_template(
+            tokenized = tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 return_tensors="pt",
-            ).to(device)
+            )
+            # apply_chat_template returns a BatchEncoding (dict-like), not a raw
+            # tensor — extract input_ids explicitly before passing to generate().
+            input_ids = tokenized["input_ids"].to(device)
             with torch.no_grad():
                 output_ids = model.generate(
                     input_ids,
