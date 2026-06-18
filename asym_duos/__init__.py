@@ -32,6 +32,7 @@ from .utils import (
     _parse_ppr_response,
     run_ppr_check,
     compute_emd_metrics,
+    compute_martingale_posterior_metrics,
     ppr_system_prompt,
 )
 
@@ -67,5 +68,6 @@ __all__ = [
     '_parse_ppr_response',
     'run_ppr_check',
     'compute_emd_metrics',
+    'compute_martingale_posterior_metrics',
     'ppr_system_prompt',
 ]

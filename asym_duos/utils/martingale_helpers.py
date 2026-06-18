@@ -271,30 +271,38 @@ def run_ppr_check(
     logger,
     label_chars: list,
     n_ppr_samples: int = 100,
+    get_probs_seed: Optional[Callable[[List[str]], np.ndarray]] = None,
+    n_seed_answers: int = 0,
+    J: int = 1,
 ) -> dict:
-    """PPR variant of the martingale check.
+    """PPR variant of the martingale check with optional direct-query seeding and J trajectories.
 
-    At each step k the PPR provider generates n_ppr_samples answers in a single
-    call and returns their empirical frequency as the distribution estimate.
-    Between steps, n_ppr_samples seed answers sampled from the previous
-    distribution are prepended to the question to accelerate convergence.
+    J independent trajectories are run per question to estimate the martingale
+    posterior Law(θ_∞ | x_Q).  Each trajectory is a K-step PPR chain; the J
+    converged distributions (step K of each run) are the posterior samples.
 
-    Prompts passed to get_probs have their trailing '\\nAnswer:' stripped;
-    after step 0 they additionally carry a 'Previously sampled answers:' line.
+    Seeding protocol (when get_probs_seed and n_seed_answers are set):
+      - get_probs_seed is called ONCE per question to get the direct-query
+        distribution; n_seed_answers seeds are re-sampled independently for
+        each of the J trajectories so they remain i.i.d.
+      - k=0: question body + direct-query seeds for this trajectory.
+      - k>0: question body + direct-query seeds + PPR samples from step k-1.
+
+    prompt_history records only trajectory j=0 to keep memory bounded.
 
     Returns
     -------
     dict with keys:
-        distributions  (N, K+1, C)
+        distributions  (N, J, K+1, C)
         true_labels    (N,)
-        input_texts    list[str]   -- raw initial prompts (with Answer: suffix)
+        input_texts    list[str]
         data_indices   (N,)
-        prompt_history (N, K+1)   -- exact prompt fed to get_probs at each step
+        prompt_history (N, K+1)   -- prompts from trajectory j=0
     """
     N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
     selected_indices = rng.choice(len(dataset), size=N, replace=False)
 
-    distributions = np.zeros((N, K + 1, n_classes), dtype=np.float32)
+    distributions = np.zeros((N, J, K + 1, n_classes), dtype=np.float32)
     true_labels = np.zeros(N, dtype=np.int32)
     input_texts: List[str] = []
     initial_prompts: List[str] = []
@@ -313,31 +321,60 @@ def run_ppr_check(
     except Exception:
         data_indices = selected_indices.astype(np.int32)
 
-    current_prompts = list(initial_prompts)
-    all_prompts: List[List[str]] = []
+    # Direct-query seed distribution: one call per question, shared across all J runs.
+    # Each run re-samples its own n_seed_answers labels so the J trajectories are i.i.d.
+    seed_dist: Optional[np.ndarray] = None
+    if get_probs_seed is not None and n_seed_answers > 0:
+        logger.info(
+            f"  Direct-query seeding: {n_seed_answers} seeds × {J} trajectories ..."
+        )
+        seed_dist = get_probs_seed(input_texts)  # (N, n_classes)
 
-    for k in range(K + 1):
-        all_prompts.append(list(current_prompts))
-        logger.info(f"  PPR iteration k={k}/{K} ...")
-        probs_k = get_probs(current_prompts)
-        distributions[:, k, :] = probs_k
+    def _make_ppr_prompt(body: str, seeds: List[str]) -> str:
+        return _insert_prev_answers_ppr(body, seeds) if seeds else body
 
-        if k < K:
-            next_prompts: List[str] = []
+    first_run_prompts: List[List[str]] = []  # track j=0 prompts for prompt_history
+
+    for j in range(J):
+        logger.info(f"  Trajectory j={j + 1}/{J} ...")
+
+        # Re-sample seeds independently for each trajectory
+        direct_seeds_j: List[List[str]] = [[] for _ in range(N)]
+        if seed_dist is not None:
             for i in range(N):
-                p = probs_k[i].astype(np.float64)
+                p = seed_dist[i].astype(np.float64)
                 p /= p.sum()
-                seed_indices = rng.choice(n_classes, size=n_ppr_samples, p=p)
-                seeds = [label_chars[idx] for idx in seed_indices]
-                next_prompts.append(
-                    _insert_prev_answers_ppr(initial_prompts[i], seeds)
-                )
-            current_prompts = next_prompts
+                idxs = rng.choice(n_classes, size=n_seed_answers, p=p)
+                direct_seeds_j[i] = [label_chars[idx] for idx in idxs]
 
-    prompt_history = np.array(all_prompts, dtype=object).T  # (N, K+1)
+        current_prompts = [
+            _make_ppr_prompt(initial_prompts[i], direct_seeds_j[i]) for i in range(N)
+        ]
+
+        for k in range(K + 1):
+            if j == 0:
+                first_run_prompts.append(list(current_prompts))
+            logger.info(f"    k={k}/{K} ...")
+            probs_k = get_probs(current_prompts)
+            distributions[:, j, k, :] = probs_k
+
+            if k < K:
+                next_prompts: List[str] = []
+                for i in range(N):
+                    p = probs_k[i].astype(np.float64)
+                    p /= p.sum()
+                    ppr_idxs = rng.choice(n_classes, size=n_ppr_samples, p=p)
+                    ppr_seeds = [label_chars[idx] for idx in ppr_idxs]
+                    combined = direct_seeds_j[i] + ppr_seeds
+                    next_prompts.append(
+                        _insert_prev_answers_ppr(initial_prompts[i], combined)
+                    )
+                current_prompts = next_prompts
+
+    prompt_history = np.array(first_run_prompts, dtype=object).T  # (N, K+1)
 
     return {
-        "distributions": distributions,
+        "distributions": distributions,   # (N, J, K+1, C)
         "true_labels": true_labels,
         "input_texts": input_texts,
         "data_indices": data_indices,
@@ -348,27 +385,62 @@ def run_ppr_check(
 def compute_emd_metrics(distributions: np.ndarray) -> dict:
     """Compute Expected Martingale Drift (EMD) from a PPR distribution trajectory.
 
-    EMD = (1/K) * sum_{k=1}^{K} E[TV(p^(k), p^(0))]
+    EMD = (1/K) * mean_{j,n} sum_{k=1}^{K} TV(p^(k,j), p^(0,j))
 
-    where p^(0) is the unseeded distribution and p^(k) for k>=1 are the
-    seeded estimates.  A value near 0 means the distribution stabilises
-    immediately; larger values indicate burn-in drift.
-
-    Parameters
-    ----------
-    distributions : (N, K+1, C)  — output of run_ppr_check
+    Accepts both (N, J, K+1, C) from run_ppr_check and the legacy (N, K+1, C)
+    shape (J=1 case); the latter is promoted to (N, 1, K+1, C) internally.
 
     Returns
     -------
-    dict with scalar 'emd' and per-step array 'emd_profile' (length K).
+    dict with scalar 'emd' and per-step array 'emd_profile' (length K),
+    averaged over both questions N and trajectories J.
     """
-    p0 = distributions[:, 0:1, :]          # (N, 1, C)  — broadcast anchor
-    p_rest = distributions[:, 1:, :]       # (N, K, C)
-    # TV distance per question per step
-    tv = 0.5 * np.abs(p_rest - p0).sum(axis=-1)  # (N, K)
-    emd_profile = tv.mean(axis=0)                  # (K,)
+    if distributions.ndim == 3:
+        distributions = distributions[:, None, :, :]  # (N, 1, K+1, C)
+
+    p0 = distributions[:, :, 0:1, :]       # (N, J, 1,  C) — anchor per trajectory
+    p_rest = distributions[:, :, 1:, :]    # (N, J, K,  C)
+    tv = 0.5 * np.abs(p_rest - p0).sum(axis=-1)  # (N, J, K)
+    emd_profile = tv.mean(axis=(0, 1))             # (K,)  averaged over N and J
     emd = float(emd_profile.mean())
     return {
         "emd": emd,
         "emd_profile": emd_profile,
+    }
+
+
+def compute_martingale_posterior_metrics(distributions: np.ndarray) -> dict:
+    """Estimate the martingale posterior from J converged distributions.
+
+    Uses the K-th step (last step) of each of the J independent trajectories
+    as i.i.d. samples from Law(θ_∞ | x_Q).
+
+    Parameters
+    ----------
+    distributions : (N, J, K+1, C)  — output of run_ppr_check with J > 1
+
+    Returns
+    -------
+    dict with:
+        posterior_samples       (N, J, C)  -- converged dist from each trajectory
+        posterior_mean          (N, C)     -- mean converged distribution
+        posterior_var           (N, C)     -- variance across J trajectories
+        posterior_entropy       (N,)       -- entropy of the mean distribution
+        mean_posterior_var      float      -- scalar: mean inter-trajectory variance
+        mean_posterior_entropy  float      -- scalar: mean entropy
+    """
+    posterior_samples = distributions[:, :, -1, :]   # (N, J, C)
+    posterior_mean = posterior_samples.mean(axis=1)   # (N, C)
+    posterior_var = posterior_samples.var(axis=1)     # (N, C)
+
+    eps = 1e-10
+    entropy = -(posterior_mean * np.log(posterior_mean + eps)).sum(axis=-1)  # (N,)
+
+    return {
+        "posterior_samples": posterior_samples,
+        "posterior_mean": posterior_mean,
+        "posterior_var": posterior_var,
+        "posterior_entropy": entropy,
+        "mean_posterior_var": float(posterior_var.mean()),
+        "mean_posterior_entropy": float(entropy.mean()),
     }

@@ -1,3 +1,4 @@
+import re
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -23,7 +24,13 @@ def _parse_ppr_response(text: str, label_chars: List[str], N: int = 100) -> np.n
         if line in label_set:
             counts[label_chars.index(line)] += 1
         else:
-            counts += 1.0 / n_classes
+            # Verbose models (e.g. Qwen2-7B) emit lines like "The correct answer is B) Mexico".
+            # Extract the single standalone label letter, if unambiguous.
+            candidates = [c for c in re.findall(r'\b[A-Z]\b', line) if c in label_set]
+            if len(candidates) == 1:
+                counts[label_chars.index(candidates[0])] += 1
+            else:
+                counts += 1.0 / n_classes
     if counts.sum() == 0:
         counts = np.ones(n_classes, dtype=np.float64)
     return (counts / counts.sum()).astype(np.float32)
@@ -257,11 +264,26 @@ def _build_ppr_hf_provider(
 ) -> Callable[[List[str]], np.ndarray]:
     """HuggingFace PPR provider: generate n_ppr_samples answers in one forward pass.
 
-    Requires a tokenizer with apply_chat_template support (LLaMA, Mistral, Qwen, etc.).
-    Each prompt must have its trailing '\\nAnswer:' already stripped.
+    Uses prefix_allowed_tokens_fn to hard-enforce the LETTER\\n pattern at the
+    token level, so instruction-tuned models that ignore format instructions
+    (e.g. Qwen2-7B) still produce single-character outputs.
     """
     n_classes = len(label_chars)
     sys_prompt = ppr_system_prompt(n_classes, N=n_ppr_samples)
+
+    # Collect every token ID that decodes to a label char, across context variants
+    # (bare, space-prefixed, newline-prefixed) to be robust across tokenizers.
+    _label_ids: set = set()
+    for c in label_chars:
+        for prefix in ("", " ", "\n"):
+            ids = tokenizer.encode(prefix + c, add_special_tokens=False)
+            if ids:
+                _label_ids.add(ids[-1])
+    label_token_ids = sorted(_label_ids)
+
+    newline_token_ids = tokenizer.encode("\n", add_special_tokens=False)
+    if not newline_token_ids:
+        newline_token_ids = [tokenizer.encode("\n")[0]]
 
     def get_probs(prompts: List[str]) -> np.ndarray:
         probs = np.zeros((len(prompts), n_classes), dtype=np.float32)
@@ -278,15 +300,23 @@ def _build_ppr_hf_provider(
             # apply_chat_template returns a BatchEncoding (dict-like), not a raw
             # tensor — extract input_ids explicitly before passing to generate().
             input_ids = tokenized["input_ids"].to(device)
+            input_length = input_ids.shape[1]
+
+            def prefix_allowed_tokens_fn(_batch_id, prefix_ids):
+                gen_len = len(prefix_ids) - input_length
+                return label_token_ids if gen_len % 2 == 0 else newline_token_ids
+
             with torch.no_grad():
                 output_ids = model.generate(
                     input_ids,
-                    max_new_tokens=n_ppr_samples * 3,
-                    do_sample=False,
+                    max_new_tokens=n_ppr_samples * 2,
+                    do_sample=True,
+                    temperature=1.0,
                     pad_token_id=tokenizer.eos_token_id,
+                    prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
                 )
             generated = tokenizer.decode(
-                output_ids[0][input_ids.shape[1]:], skip_special_tokens=True
+                output_ids[0][input_length:], skip_special_tokens=True
             )
             probs[i] = _parse_ppr_response(generated, label_chars, n_ppr_samples)
         return probs
