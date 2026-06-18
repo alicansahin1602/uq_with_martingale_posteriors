@@ -24,6 +24,7 @@ from .martingale_helpers import (
     _load_tokenizer_only,
     run_ppr_check,
     compute_emd_metrics,
+    compute_martingale_posterior_metrics,
 )
 from .system_prompt import mcqa_system_prompt, ppr_system_prompt
 
@@ -54,6 +55,7 @@ __all__ = [
     '_load_tokenizer_only',
     'run_ppr_check',
     'compute_emd_metrics',
+    'compute_martingale_posterior_metrics',
     'mcqa_system_prompt',
     'ppr_system_prompt',
 ]
