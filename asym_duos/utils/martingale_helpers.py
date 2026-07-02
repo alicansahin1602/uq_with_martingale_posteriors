@@ -16,14 +16,31 @@ def _strip_answer_suffix(prompt: str) -> str:
     return prompt
 
 
-def _insert_prev_answers_ppr(prompt_body: str, prev_labels: List[str]) -> str:
-    """Prepend seed answers to a PPR prompt body (Answer: suffix already stripped).
+#def _insert_prev_answers_ppr(prompt_body: str, prev_labels: List[str]) -> str:
+#    """Prepend seed answers to a PPR prompt body (Answer: suffix already stripped).
 
-    Adds a line of the form 'Previously sampled answers: A, B, A, ...' before
-    the final newline so the model can use them as a warm-start signal.
-    """
-    history = ", ".join(prev_labels)
-    return f"{prompt_body}\nPreviously sampled answers: {history}"
+#    Adds a line of the form 'Previously sampled answers: A, B, A, ...' before
+#    the final newline so the model can use them as a warm-start signal.
+#    """
+#    history = ", ".join(prev_labels)
+#    return f"{prompt_body}\nPreviously sampled answers: {history}"
+
+def _insert_prev_answers_ppr(prompt_body: str, prev_labels: List[str], label_chars: List[str] = None, prompt_dist: List[str] = None) -> str:
+    if not prev_labels:
+        return prompt_body
+
+    if prompt_dist is not None:
+        dist_str = ", ".join(f"{label_chars[c]}={prompt_dist[c]:.0%}" for c in range(len(prompt_dist)))
+        seed_line = f"\nPreviously sampled answers: {', '.join(prev_labels)}" if prev_labels else ""
+        return (
+            f"{prompt_body}"
+            f"{seed_line}"
+            f"\nCurrent belief distribution: {dist_str}."
+            f"\nAnchor to this distribution and only update proportionally to new evidence."
+        )   
+    # fallback
+    return f"{prompt_body}\nPreviously sampled answers: {', '.join(prev_labels)}"
+
 
 def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
     """Splice the answer history into a prompt just before 'Answer:'.
@@ -223,7 +240,7 @@ def save_martingale_results(
     input_texts: List[str],
     prompt_history: np.ndarray,
     metrics: dict,
-    logger,
+    logger
 ) -> str:
     """Append results for this seed to <work_dir>/martingale_results.npz.
 
@@ -297,7 +314,7 @@ def run_ppr_check(
         true_labels    (N,)
         input_texts    list[str]
         data_indices   (N,)
-        prompt_history (N, K+1)   -- prompts from trajectory j=0
+        prompt_history (N, J, K+1) -- prompts for every trajectory and step
     """
     N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
     selected_indices = rng.choice(len(dataset), size=N, replace=False)
@@ -333,7 +350,7 @@ def run_ppr_check(
     def _make_ppr_prompt(body: str, seeds: List[str]) -> str:
         return _insert_prev_answers_ppr(body, seeds) if seeds else body
 
-    first_run_prompts: List[List[str]] = []  # track j=0 prompts for prompt_history
+    all_run_prompts: List[List[List[str]]] = []  # [j][k] = list of N prompts
 
     for j in range(J):
         logger.info(f"  Trajectory j={j + 1}/{J} ...")
@@ -351,9 +368,10 @@ def run_ppr_check(
             _make_ppr_prompt(initial_prompts[i], direct_seeds_j[i]) for i in range(N)
         ]
 
+        traj_prompts: List[List[str]] = []
+        accumulated_ppr_seeds: List[List[str]] = [[] for _ in range(N)]
         for k in range(K + 1):
-            if j == 0:
-                first_run_prompts.append(list(current_prompts))
+            traj_prompts.append(list(current_prompts))
             logger.info(f"    k={k}/{K} ...")
             probs_k = get_probs(current_prompts)
             distributions[:, j, k, :] = probs_k
@@ -363,15 +381,17 @@ def run_ppr_check(
                 for i in range(N):
                     p = probs_k[i].astype(np.float64)
                     p /= p.sum()
-                    ppr_idxs = rng.choice(n_classes, size=n_ppr_samples, p=p)
-                    ppr_seeds = [label_chars[idx] for idx in ppr_idxs]
-                    combined = direct_seeds_j[i] + ppr_seeds
+                    accumulated_ppr_seeds[i].append(label_chars[int(np.argmax(p))])
+                    combined = direct_seeds_j[i] + accumulated_ppr_seeds[i]
                     next_prompts.append(
-                        _insert_prev_answers_ppr(initial_prompts[i], combined)
+                        _insert_prev_answers_ppr(initial_prompts[i], combined, label_chars=label_chars, prompt_dist=p)
                     )
                 current_prompts = next_prompts
 
-    prompt_history = np.array(first_run_prompts, dtype=object).T  # (N, K+1)
+        all_run_prompts.append(traj_prompts)
+
+    # all_run_prompts[j][k] is a list of N prompts -> transpose to (N, J, K+1)
+    prompt_history = np.array(all_run_prompts, dtype=object).transpose(2, 0, 1)
 
     return {
         "distributions": distributions,   # (N, J, K+1, C)

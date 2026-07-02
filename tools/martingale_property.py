@@ -119,11 +119,11 @@ def parse_args():
 # Output path
 # ---------------------------------------------------------------------------
 
-def _build_work_dir(root: str, cfg_path: str) -> str:
+def _build_work_dir(root: str, cfg_path: str, method: str) -> str:
     # 'configs/arc_c_qwen2_7b/lora_arc_c_qwen2_7b.yaml'
     # -> '<root>/arc_c_qwen2_7b/martingale_check'
     folder = osp.basename(osp.dirname(cfg_path))
-    return osp.join(root, folder, "martingale_check")
+    return osp.join(root, folder, "martingale_check", method)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -152,7 +152,8 @@ def main():
         if not cfg.get("api_model", None):
             cfg.train_cfg["per_device_eval_batch_size"] = 4
 
-    work_dir = _build_work_dir(args.work_dir, args.config)
+    method = 'iterative' if args.mode == 'iterative' else 'ppr'
+    work_dir = _build_work_dir(args.work_dir, args.config, method)
     mmengine.mkdir_or_exist(work_dir)
 
     logger = setup_logger(
@@ -298,6 +299,7 @@ def main():
         label_chars = splits[0].label_chars
         n_ppr_samples = args.n_ppr_samples
         get_probs_seed = None
+
         if args.mode == "ppr":
             get_probs = _build_ppr_hf_provider(
                 model, tokenizer, label_chars, n_ppr_samples, device
@@ -397,6 +399,7 @@ def main():
             )
     logger.info("=" * 60)
 
+    
     out_path = save_martingale_results(
         work_dir=work_dir,
         seed=args.seed,
@@ -407,7 +410,7 @@ def main():
         input_texts=result["input_texts"],
         prompt_history=result["prompt_history"],
         metrics=metrics,
-        logger=logger,
+        logger=logger
     )
 
     print(f"\n[martingale_property] Completed.")
