@@ -297,9 +297,10 @@ def _build_ppr_hf_provider(
                 add_generation_prompt=True,
                 return_tensors="pt",
             )
-            # apply_chat_template returns a BatchEncoding (dict-like), not a raw
-            # tensor — extract input_ids explicitly before passing to generate().
-            input_ids = tokenized["input_ids"].to(device)
+            if isinstance(tokenized, torch.Tensor):
+                input_ids = tokenized.to(device)
+            else:
+                input_ids = tokenized["input_ids"].to(device)
             input_length = input_ids.shape[1]
 
             def prefix_allowed_tokens_fn(_batch_id, prefix_ids):
