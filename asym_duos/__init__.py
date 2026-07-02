@@ -22,10 +22,16 @@ from .utils import (
     _build_ppr_anthropic_provider,
     _build_ppr_deepseek_provider,
     _parse_ppr_response,
+    _build_hf_generate,
+    _build_openai_generate,
+    _build_anthropic_generate,
+    _build_deepseek_generate,
     run_ppr_check,
+    run_retrieval_check,
     compute_emd_metrics,
     compute_martingale_posterior_metrics,
     ppr_system_prompt,
+    imputation_system_prompt,
 )
 
 __all__ = [
@@ -50,8 +56,14 @@ __all__ = [
     '_build_ppr_anthropic_provider',
     '_build_ppr_deepseek_provider',
     '_parse_ppr_response',
+    '_build_hf_generate',
+    '_build_openai_generate',
+    '_build_anthropic_generate',
+    '_build_deepseek_generate',
     'run_ppr_check',
+    'run_retrieval_check',
     'compute_emd_metrics',
     'compute_martingale_posterior_metrics',
     'ppr_system_prompt',
+    'imputation_system_prompt',
 ]

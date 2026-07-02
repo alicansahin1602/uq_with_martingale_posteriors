@@ -7,7 +7,7 @@ import anthropic
 
 from typing import Callable, List
 from openai import PermissionDeniedError
-from .system_prompt import mcqa_system_prompt, ppr_system_prompt
+from .system_prompt import mcqa_system_prompt, ppr_system_prompt, imputation_system_prompt
 
 
 def _parse_ppr_response(text: str, label_chars: List[str], N: int = 100) -> np.ndarray:
@@ -252,7 +252,131 @@ def _build_deepseek_provider(
 
 
 # ---------------------------------------------------------------------------
-# PPR providers — generate N i.i.d. samples in a single call
+# Text-generation providers — for the imputation step for method retrieval
+# ---------------------------------------------------------------------------
+
+def _build_hf_generate(
+    model,
+    tokenizer,
+    device: torch.device,
+    max_new_tokens: int = 200,
+) -> Callable[[List[str]], List[str]]:
+    """HuggingFace text generation provider for the imputation step."""
+    sys_prompt = imputation_system_prompt()
+
+    def generate_text(prompts: List[str]) -> List[str]:
+        results = []
+        for prompt in prompts:
+            messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": prompt},
+            ]
+            tokenized = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
+            if isinstance(tokenized, torch.Tensor):
+                input_ids = tokenized.to(device)
+            else:
+                input_ids = tokenized["input_ids"].to(device)
+            input_length = input_ids.shape[1]
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=1.0,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            text = tokenizer.decode(
+                output_ids[0][input_length:], skip_special_tokens=True
+            )
+            results.append(text)
+        return results
+
+    return generate_text
+
+
+def _build_openai_generate(
+    model_name: str,
+    api: str = None,
+    max_new_tokens: int = 200,
+) -> Callable[[List[str]], List[str]]:
+    """OpenAI text generation provider for the imputation step."""
+    client = openai.OpenAI(api_key=api)
+    sys_prompt = imputation_system_prompt()
+
+    def generate_text(prompts: List[str]) -> List[str]:
+        results = []
+        for prompt in prompts:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_new_tokens,
+                temperature=1.0,
+            )
+            results.append(resp.choices[0].message.content or "")
+        return results
+
+    return generate_text
+
+
+def _build_anthropic_generate(
+    model_name: str,
+    api: str = None,
+    max_new_tokens: int = 200,
+) -> Callable[[List[str]], List[str]]:
+    """Anthropic text generation provider for the imputation step."""
+    client = anthropic.Anthropic(api_key=api)
+    sys_prompt = imputation_system_prompt()
+
+    def generate_text(prompts: List[str]) -> List[str]:
+        results = []
+        for prompt in prompts:
+            resp = client.messages.create(
+                model=model_name,
+                max_tokens=max_new_tokens,
+                system=sys_prompt,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            results.append(resp.content[0].text if resp.content else "")
+        return results
+
+    return generate_text
+
+
+def _build_deepseek_generate(
+    model_name: str,
+    api: str = None,
+    max_new_tokens: int = 200,
+) -> Callable[[List[str]], List[str]]:
+    """DeepSeek text generation provider for the imputation step."""
+    client = openai.OpenAI(api_key=api, base_url="https://api.deepseek.com")
+    sys_prompt = imputation_system_prompt()
+
+    def generate_text(prompts: List[str]) -> List[str]:
+        results = []
+        for prompt in prompts:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=max_new_tokens,
+                temperature=1.0,
+            )
+            results.append(resp.choices[0].message.content or "")
+        return results
+
+    return generate_text
+
+# ---------------------------------------------------------------------------
+# Probability providers
 # ---------------------------------------------------------------------------
 
 def _build_ppr_hf_provider(

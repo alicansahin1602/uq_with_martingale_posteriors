@@ -5,25 +5,20 @@ import transformers
 import numpy as np
 import mmengine
 import os.path as osp
+from .finding_similar_questions import SimilarQuestionRetriever
+
 
 _ANSWER_SUFFIX = "\nAnswer:"
 
 
+# ---------------------------------------------------------------------------
+# Prompt manipulation helpers
+# ---------------------------------------------------------------------------
 def _strip_answer_suffix(prompt: str) -> str:
     """Remove trailing '\\nAnswer:' from a prompt so it can be fed to a PPR provider."""
     if prompt.endswith(_ANSWER_SUFFIX):
         return prompt[: -len(_ANSWER_SUFFIX)]
     return prompt
-
-
-#def _insert_prev_answers_ppr(prompt_body: str, prev_labels: List[str]) -> str:
-#    """Prepend seed answers to a PPR prompt body (Answer: suffix already stripped).
-
-#    Adds a line of the form 'Previously sampled answers: A, B, A, ...' before
-#    the final newline so the model can use them as a warm-start signal.
-#    """
-#    history = ", ".join(prev_labels)
-#    return f"{prompt_body}\nPreviously sampled answers: {history}"
 
 def _insert_prev_answers_ppr(prompt_body: str, prev_labels: List[str], label_chars: List[str] = None, prompt_dist: List[str] = None) -> str:
     if not prev_labels:
@@ -67,6 +62,14 @@ def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
     return f"{body}\nYour previous answers were: {history}{_ANSWER_SUFFIX}"
 
 
+def _build_imputation_prompt(context_so_far: str) -> str:
+    """Build the user-turn prompt asking the model to generate one more Q&A pair."""
+    return (
+        f"{context_so_far}\n\n"
+        "Continue the sequence above by writing exactly one more "
+        "multiple-choice question-and-answer pair in the same format."
+    )
+
 def _load_tokenizer_only(cfg) -> transformers.PreTrainedTokenizer:
     """Load just the tokenizer from the model config section, no weights."""
     tokenizer_cfg = deepcopy(dict(cfg.model.tokenizer_cfg))
@@ -86,6 +89,10 @@ def _load_tokenizer_only(cfg) -> transformers.PreTrainedTokenizer:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
+
+# ---------------------------------------------------------------------------
+# Running martingale checks for different methods
+# ---------------------------------------------------------------------------
 
 def run_martingale_check(
     get_probs: Callable[[List[str]], np.ndarray],
@@ -181,101 +188,6 @@ def run_martingale_check(
         "data_indices": data_indices,
         "prompt_history": prompt_history,
     }
-
-def compute_martingale_metrics(distributions: np.ndarray, true_labels: np.ndarray) -> dict:
-    """Compute drift statistics from the full distribution trajectory.
-
-    Parameters
-    ----------
-    distributions : (N, K+1, C)
-    true_labels   : (N,)
-
-    Returns
-    -------
-    dict of scalar summary metrics and per-question / per-step arrays.
-    """
-    p0 = distributions[:, 0, :]       # (N, C)  initial distribution
-    p_iter = distributions[:, 1:, :]  # (N, K, C) iterated distributions
-
-    # Mean iterated distribution per question -- martingale says this ≈ p0
-    p_mean = p_iter.mean(axis=1)      # (N, C)
-
-    # TV distance between mean iterated and initial: 0.5 * ||p_mean - p0||_1
-    tv_per_q = 0.5 * np.abs(p_mean - p0).sum(axis=-1)           # (N,)
-
-    # L1 drift at each step: ||p_k - p0||_1
-    l1_drift = np.abs(p_iter - p0[:, None, :]).sum(axis=-1)      # (N, K)
-
-    # Drift profile: mean L1 drift at each step (averaged over questions)
-    drift_profile = l1_drift.mean(axis=0)                        # (K,)
-
-    # Variance of each class probability across iterations (per question)
-    class_variance = p_iter.var(axis=1)                          # (N, C)
-
-    # Greedy accuracy on the initial prediction
-    pred_labels = p0.argmax(axis=-1)
-    accuracy = float((pred_labels == true_labels).mean())
-
-    return {
-        # Scalar summaries
-        "mean_tv": float(tv_per_q.mean()),
-        "pass_rate_tv_005": float((tv_per_q < 0.05).mean()),
-        "pass_rate_tv_010": float((tv_per_q < 0.10).mean()),
-        "mean_l1": float(l1_drift.mean()),
-        "accuracy_at_p0": accuracy,
-        # Arrays
-        "tv_per_question": tv_per_q,
-        "mean_l1_per_question": l1_drift.mean(axis=1),
-        "drift_profile": drift_profile,
-        "class_variance": class_variance,
-    }
-
-def save_martingale_results(
-    work_dir: str,
-    seed: int,
-    K: int,
-    distributions: np.ndarray,
-    true_labels: np.ndarray,
-    data_indices: np.ndarray,
-    input_texts: List[str],
-    prompt_history: np.ndarray,
-    metrics: dict,
-    logger
-) -> str:
-    """Append results for this seed to <work_dir>/martingale_results.npz.
-
-    The npz mirrors the structure used by save_predictions: top-level keys are
-    seed strings, values are nested dicts (saved as numpy object arrays).
-    """
-    mmengine.mkdir_or_exist(work_dir)
-    out_path = osp.join(work_dir, "martingale_results.npz")
-
-    existing = (
-        dict(np.load(out_path, allow_pickle=True)) if osp.exists(out_path) else {}
-    )
-    existing[str(seed)] = {
-        "distributions": distributions,          # (N, K+1, C)
-        "true_labels": true_labels,              # (N,)
-        "data_indices": data_indices,            # (N,)
-        "input_texts": np.array(input_texts, dtype=object),
-        "prompt_history": prompt_history,        # (N, K+1) prompts fed at each step
-        "K": np.int32(K),
-        # Scalar metrics
-        "mean_tv": np.float32(metrics["mean_tv"]),
-        "pass_rate_tv_005": np.float32(metrics["pass_rate_tv_005"]),
-        "pass_rate_tv_010": np.float32(metrics["pass_rate_tv_010"]),
-        "mean_l1": np.float32(metrics["mean_l1"]),
-        "accuracy_at_p0": np.float32(metrics["accuracy_at_p0"]),
-        # Per-question / per-step arrays
-        "tv_per_question": metrics["tv_per_question"],
-        "mean_l1_per_question": metrics["mean_l1_per_question"],
-        "drift_profile": metrics["drift_profile"],
-        "class_variance": metrics["class_variance"],
-    }
-
-    np.savez_compressed(out_path, **existing)
-    logger.info(f"Results saved to {out_path}")
-    return out_path
 
 
 def run_ppr_check(
@@ -401,6 +313,159 @@ def run_ppr_check(
         "prompt_history": prompt_history,
     }
 
+def run_retrieval_check(
+    get_probs: Callable[[List[str]], np.ndarray],
+    generate_text: Callable[[List[str]], List[str]],
+    n_classes: int,
+    dataset,
+    train_dataset,
+    m: int,
+    J: int,
+    n_samples: Optional[int],
+    rng: np.random.Generator,
+    logger,
+    label_chars: list,
+    n_shots: int = 4,
+    embedding_model: str = "all-MiniLM-L6-v2",
+) -> dict:
+    """Scenario 2 imputation check (Falck et al., ICML 2024).
+
+    For each test question:
+      - Retrieves n_shots semantically similar training examples as the
+        few-shot context D.
+      - For each of J independent repetitions:
+          1. Autoregressively generates m synthetic Q&A pairs extending D.
+          2. Predicts on x_{n+1} conditioned on D + imputed pairs (single call).
+    The J distributions are martingale posterior samples.
+
+    Returns distributions of shape (N, J, 1, C).
+    """
+    retriever = SimilarQuestionRetriever(embedding_model)
+    retriever.build_index(train_dataset, label_chars, logger=logger)
+
+    N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
+    selected_indices = rng.choice(len(dataset), size=N, replace=False)
+
+    distributions = np.zeros((N, J, 1, n_classes), dtype=np.float32)
+    true_labels = np.zeros(N, dtype=np.int32)
+    input_texts: List[str] = []
+
+    # Build D (retrieved few-shots) and target body for each question
+    d_contexts: List[str] = []
+    target_bodies: List[str] = []
+    logger.info(f"  Retrieving {n_shots} few-shot examples per question ...")
+    for i, dataset_idx in enumerate(selected_indices):
+        sample = dataset[int(dataset_idx)]
+        input_texts.append(sample["prompt"])
+        true_labels[i] = int(sample["label"])
+        target_body = _strip_answer_suffix(sample["prompt"])
+        few_shots = retriever.retrieve(target_body, n_shots)
+        d_context = "\n\n".join(f"{body}\nAnswer: {ans}" for body, ans in few_shots)
+        d_contexts.append(d_context)
+        target_bodies.append(target_body)
+
+    try:
+        all_row_ids = dataset.get_data_indices()
+        data_indices = np.array(
+            [all_row_ids[int(idx)] for idx in selected_indices], dtype=np.int32
+        )
+    except Exception:
+        data_indices = selected_indices.astype(np.int32)
+
+    all_run_prompts: List[List[List[str]]] = []
+
+    for j in range(J):
+        logger.info(f"  Trajectory j={j + 1}/{J} ...")
+
+        # Each trajectory starts fresh from the retrieved D
+        imputed_contexts = list(d_contexts)
+
+        # Autoregressively generate m synthetic Q&A pairs extending D
+        for step in range(m):
+            logger.info(f"    Imputation step {step + 1}/{m} ...")
+            imputation_prompts = [
+                _build_imputation_prompt(ctx) for ctx in imputed_contexts
+            ]
+            generated = generate_text(imputation_prompts)
+            imputed_contexts = [
+                f"{ctx}\n\n{gen.strip()}"
+                for ctx, gen in zip(imputed_contexts, generated)
+            ]
+
+        # Single prediction: D + imputed pairs + x_{n+1}
+        prediction_prompts = [
+            f"{ctx}\n\n{target}{_ANSWER_SUFFIX}"
+            for ctx, target in zip(imputed_contexts, target_bodies)
+        ]
+        logger.info(f"    Predicting on x_{{n+1}} ...")
+        probs = get_probs(prediction_prompts)
+        distributions[:, j, 0, :] = probs
+        all_run_prompts.append([prediction_prompts])
+
+    # shape: (N, J, 1)
+    prompt_history = np.array(all_run_prompts, dtype=object).transpose(2, 0, 1)
+
+    return {
+        "distributions": distributions,
+        "true_labels": true_labels,
+        "input_texts": input_texts,
+        "data_indices": data_indices,
+        "prompt_history": prompt_history,
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Computing metrics
+# ---------------------------------------------------------------------------
+def compute_martingale_metrics(distributions: np.ndarray, true_labels: np.ndarray) -> dict:
+    """Compute drift statistics from the full distribution trajectory.
+
+    Parameters
+    ----------
+    distributions : (N, K+1, C)
+    true_labels   : (N,)
+
+    Returns
+    -------
+    dict of scalar summary metrics and per-question / per-step arrays.
+    """
+    p0 = distributions[:, 0, :]       # (N, C)  initial distribution
+    p_iter = distributions[:, 1:, :]  # (N, K, C) iterated distributions
+
+    # Mean iterated distribution per question -- martingale says this ≈ p0
+    p_mean = p_iter.mean(axis=1)      # (N, C)
+
+    # TV distance between mean iterated and initial: 0.5 * ||p_mean - p0||_1
+    tv_per_q = 0.5 * np.abs(p_mean - p0).sum(axis=-1)           # (N,)
+
+    # L1 drift at each step: ||p_k - p0||_1
+    l1_drift = np.abs(p_iter - p0[:, None, :]).sum(axis=-1)      # (N, K)
+
+    # Drift profile: mean L1 drift at each step (averaged over questions)
+    drift_profile = l1_drift.mean(axis=0)                        # (K,)
+
+    # Variance of each class probability across iterations (per question)
+    class_variance = p_iter.var(axis=1)                          # (N, C)
+
+    # Greedy accuracy on the initial prediction
+    pred_labels = p0.argmax(axis=-1)
+    accuracy = float((pred_labels == true_labels).mean())
+
+    return {
+        # Scalar summaries
+        "mean_tv": float(tv_per_q.mean()),
+        "pass_rate_tv_005": float((tv_per_q < 0.05).mean()),
+        "pass_rate_tv_010": float((tv_per_q < 0.10).mean()),
+        "mean_l1": float(l1_drift.mean()),
+        "accuracy_at_p0": accuracy,
+        # Arrays
+        "tv_per_question": tv_per_q,
+        "mean_l1_per_question": l1_drift.mean(axis=1),
+        "drift_profile": drift_profile,
+        "class_variance": class_variance,
+    }
+
 
 def compute_emd_metrics(distributions: np.ndarray) -> dict:
     """Compute Expected Martingale Drift (EMD) from a PPR distribution trajectory.
@@ -464,3 +529,54 @@ def compute_martingale_posterior_metrics(distributions: np.ndarray) -> dict:
         "mean_posterior_var": float(posterior_var.mean()),
         "mean_posterior_entropy": float(entropy.mean()),
     }
+
+# ---------------------------------------------------------------------------
+# Saving results
+# ---------------------------------------------------------------------------
+
+def save_martingale_results(
+    work_dir: str,
+    seed: int,
+    K: int,
+    distributions: np.ndarray,
+    true_labels: np.ndarray,
+    data_indices: np.ndarray,
+    input_texts: List[str],
+    prompt_history: np.ndarray,
+    metrics: dict,
+    logger
+) -> str:
+    """Append results for this seed to <work_dir>/martingale_results.npz.
+
+    The npz mirrors the structure used by save_predictions: top-level keys are
+    seed strings, values are nested dicts (saved as numpy object arrays).
+    """
+    mmengine.mkdir_or_exist(work_dir)
+    out_path = osp.join(work_dir, "martingale_results.npz")
+
+    existing = (
+        dict(np.load(out_path, allow_pickle=True)) if osp.exists(out_path) else {}
+    )
+    existing[str(seed)] = {
+        "distributions": distributions,          # (N, K+1, C)
+        "true_labels": true_labels,              # (N,)
+        "data_indices": data_indices,            # (N,)
+       "input_texts": np.array(input_texts, dtype=object),
+        "prompt_history": prompt_history,        # (N, K+1) prompts fed at each step
+        "K": np.int32(K),
+        # Scalar metrics
+        "mean_tv": np.float32(metrics["mean_tv"]),
+        "pass_rate_tv_005": np.float32(metrics["pass_rate_tv_005"]),
+        "pass_rate_tv_010": np.float32(metrics["pass_rate_tv_010"]),
+        "mean_l1": np.float32(metrics["mean_l1"]),
+        "accuracy_at_p0": np.float32(metrics["accuracy_at_p0"]),
+        # Per-question / per-step arrays
+        "tv_per_question": metrics["tv_per_question"],
+        "mean_l1_per_question": metrics["mean_l1_per_question"],
+        "drift_profile": metrics["drift_profile"],
+        "class_variance": metrics["class_variance"],
+    }
+
+    np.savez_compressed(out_path, **existing)
+    logger.info(f"Results saved to {out_path}")
+    return out_path
