@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import List, Callable, Optional
+import re
 
 import transformers
 import numpy as np
@@ -69,6 +70,30 @@ def _build_imputation_prompt(context_so_far: str) -> str:
         "Continue the sequence above by writing exactly one more "
         "multiple-choice question-and-answer pair in the same format."
     )
+
+
+def _clean_generated_qa(text: str) -> Optional[str]:
+    """Extract a clean Q&A block from a model's verbose response.
+
+    Strips conversational preamble (e.g. "Sure! Here's...") and normalizes
+    the answer line from "Answer: C) explanation" to "Answer: C".
+    Returns None if no valid Question/Answer block is found.
+    """
+    q_match = re.search(r'(?i)\bquestion\s*:', text)
+    if not q_match:
+        print(f"[imputation] WARNING: no 'Question:' found in generated text:\n{text[:300]!r}")
+        return None
+    text = text[q_match.start():]
+
+    a_match = re.search(r'(?i)\banswer\s*:\s*([A-E])', text)
+    if not a_match:
+        print(f"[imputation] WARNING: no 'Answer: <letter>' found in generated text:\n{text[:300]!r}")
+        return None
+
+    letter = a_match.group(1).upper()
+    cleaned = text[: a_match.start()] + f"Answer: {letter}"
+    return cleaned.strip()
+
 
 def _load_tokenizer_only(cfg) -> transformers.PreTrainedTokenizer:
     """Load just the tokenizer from the model config section, no weights."""
@@ -388,7 +413,7 @@ def run_retrieval_check(
             ]
             generated = generate_text(imputation_prompts)
             imputed_contexts = [
-                f"{ctx}\n\n{gen.strip()}"
+                f"{ctx}\n\n{_clean_generated_qa(gen) or gen.strip()}"
                 for ctx, gen in zip(imputed_contexts, generated)
             ]
 
