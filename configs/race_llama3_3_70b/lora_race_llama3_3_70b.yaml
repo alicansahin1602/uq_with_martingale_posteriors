@@ -1,4 +1,0 @@
-_base_: ['../_base_/race.yaml', '../_base_/llama3_3_70b.yaml', '../_base_/misc.yaml', '../_base_/non_edl_schedule.yaml']
-
-process_preds:
-    npz_file: "race.npz"

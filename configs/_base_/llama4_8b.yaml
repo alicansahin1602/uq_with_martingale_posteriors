@@ -1,5 +1,5 @@
 model:
-    model_name_or_path: "meta-llama/Llama-3.3-70B-Instruct"
+    model_name_or_path: "meta-llama/Meta-Llama-3-8B-Instruct"
     peft_path: null
     model_cfg:
         type: AutoModelForCausalLM
