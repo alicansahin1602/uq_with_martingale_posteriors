@@ -24,4 +24,4 @@ tokenizer_run_cfg:
     padding: true
     truncation: true
     return_tensors: "pt"
-    max_length: 300
+    #max_length: 300
