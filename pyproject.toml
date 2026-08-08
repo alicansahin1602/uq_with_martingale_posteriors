@@ -37,6 +37,9 @@ dependencies = [
     "openai>=1.0.0",
     "anthropic>=0.20.0",
     "python-dotenv>=1.0.0",
+    # --- retrieval ---
+    "sentence-transformers>=3.0.0",
+    "faiss-cpu>=1.7.0",
 ]
 
 [project.optional-dependencies]
@@ -47,4 +50,4 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["asym_duos*"]
+include = ["martingale_consistency_and_posteriors*"]

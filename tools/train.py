@@ -30,7 +30,7 @@ from mmengine.runner.utils import set_random_seed
 from transformers import TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 
-from asym_duos import (
+from martingale_consistency_and_posteriors import (
     DATASETS,
     ClassificationMetric,
     EvidentialTrainer,
