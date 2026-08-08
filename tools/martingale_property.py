@@ -42,7 +42,7 @@ import numpy as np
 import torch
 from torch.utils.data import ConcatDataset
 from mmengine.runner.utils import set_random_seed
-from asym_duos import (
+from martingale_consistency_and_posteriors import (
      DATASETS,
      get_model_and_tokenizer,
      setup_logger,

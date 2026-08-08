@@ -50,4 +50,4 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["asym_duos*"]
+include = ["martingale_consistency_and_posteriors*"]
