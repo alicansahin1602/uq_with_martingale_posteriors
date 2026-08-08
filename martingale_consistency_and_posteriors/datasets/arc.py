@@ -35,7 +35,7 @@ class ARCDataset(ClassificationDataset):
             arc_name = 'ARC-Easy'
         else:
             raise ValueError(f'Invalid ARC name: {name_suffix}')
-        data_set = load_dataset('ai2_arc', arc_name, **dataset_cfg)
+        data_set = load_dataset('allenai/ai2_arc', arc_name, **dataset_cfg)
 
         if subset_size is not None:
             data_set = data_set.select(range(subset_size))

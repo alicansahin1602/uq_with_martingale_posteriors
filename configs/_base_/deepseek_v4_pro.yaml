@@ -1,5 +1,5 @@
 api_model:
     provider: "deepseek"
     model_name: "deepseek-v4-pro"
-    use_logprobs: true
+    use_logprobs: false
     n_api_samples: null
