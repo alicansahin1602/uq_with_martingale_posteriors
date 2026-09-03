@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Raw per-call API response logs -- can reach hundreds of MB to multiple GB
+# per run and exceed GitHub's 100MB per-file limit. The processed results
+# (martingale_results.npz) are what's actually versioned.
+data/results_mp*/**/raw_direct_query_responses_*.jsonl
+data/results_mp*/**/raw_ppr_responses_*.jsonl
+
+# Office lock files (e.g. left behind by an open .xlsx)
+**/~$*.xlsx
