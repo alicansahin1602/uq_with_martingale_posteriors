@@ -1,0 +1,5 @@
+api_model:
+    provider: "openai"
+    model_name : "gpt-4o-mini"
+    use_logprobs: true
+    n_api_samples: null

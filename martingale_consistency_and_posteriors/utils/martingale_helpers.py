@@ -1,12 +1,10 @@
 from copy import deepcopy
 from typing import List, Callable, Optional
 import re
-
 import transformers
 import numpy as np
 import mmengine
 import os.path as osp
-from .finding_similar_questions import SimilarQuestionRetriever
 
 
 _ANSWER_SUFFIX = "\nAnswer:"
@@ -60,60 +58,7 @@ def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
         )
     body = initial_prompt[: -len(_ANSWER_SUFFIX)]
     history = ", ".join(prev_labels)
-    return f"{body}\nYour previous answers were: {history}{_ANSWER_SUFFIX}"
-
-
-def _build_imputation_prompt(context_so_far: str) -> str:
-    """Build the user-turn prompt asking the model to generate one more Q&A pair."""
-    return (
-        f"{context_so_far}\n\n"
-        "Continue the sequence above by writing exactly one more "
-        "multiple-choice question-and-answer pair in the same format."
-    )
-
-
-def _clean_generated_qa(text: str) -> Optional[str]:
-    """Extract a clean Q&A block from a model's verbose response.
-
-    Strips conversational preamble (e.g. "Sure! Here's...") and normalizes
-    the answer line from "Answer: C) explanation" to "Answer: C".
-    Returns None if no valid Question/Answer block is found.
-    """
-    q_match = re.search(r'(?i)\bquestion\s*:', text)
-    if not q_match:
-        print(f"[imputation] WARNING: no 'Question:' found in generated text:\n{text[:300]!r}")
-        return None
-    text = text[q_match.start():]
-
-    a_match = re.search(r'(?i)\banswer\s*:\s*([A-E])', text)
-    if not a_match:
-        print(f"[imputation] WARNING: no 'Answer: <letter>' found in generated text:\n{text[:300]!r}")
-        return None
-
-    letter = a_match.group(1).upper()
-    cleaned = text[: a_match.start()] + f"Answer: {letter}"
-    return cleaned.strip()
-
-
-def _load_tokenizer_only(cfg) -> transformers.PreTrainedTokenizer:
-    """Load just the tokenizer from the model config section, no weights."""
-    tokenizer_cfg = deepcopy(dict(cfg.model.tokenizer_cfg))
-    tokenizer_cls = getattr(transformers, tokenizer_cfg.pop("type"))
-    tokenizer = tokenizer_cls.from_pretrained(
-        cfg.model.model_name_or_path, **tokenizer_cfg
-    )
-    special_tokens = {
-        k: getattr(tokenizer, v.split(".")[-1])
-        if isinstance(v, str) and v.startswith("tokenizer")
-        else v
-        for k, v in cfg.model.special_tokens.items()
-    }
-    if special_tokens:
-        tokenizer.add_special_tokens(special_tokens)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
-
+    return f"{body}\nYour prior answers in previous steps to this specific question were: {history}{_ANSWER_SUFFIX}"
 
 # ---------------------------------------------------------------------------
 # Running martingale checks for different methods
@@ -128,7 +73,8 @@ def run_martingale_check(
     batch_size: int,
     rng: np.random.Generator,
     logger,
-    label_chars: list
+    label_chars: list,
+    J: int = 1,
 ) -> dict:
     """Iterate K feedback steps and record the full distribution trajectory.
 
@@ -140,21 +86,27 @@ def run_martingale_check(
     get_probs is a provider callable built by one of the _build_*_provider
     factories; it abstracts over HuggingFace, OpenAI, and Anthropic backends.
 
+    J independent trajectories are run per question, each starting fresh
+    from the same initial prompt and independently resampling its own answer
+    history at every step (same idea as run_ppr_check's J, applied to the
+    one-call-per-step iterative provider). The J converged (k=K) distributions
+    are i.i.d. samples from the martingale posterior Law(theta_K | x_Q).
+
     Returns
     -------
     dict with keys:
-        distributions  (N, K+1, C) -- p_0 through p_K for every question
+        distributions  (N, J, K+1, C) -- p_0 through p_K for every question and trajectory
         true_labels    (N,)
         input_texts    list[str]   -- raw initial prompt per question
         data_indices   (N,)        -- dataset row ids
-        prompt_history (N, K+1)   -- exact prompt fed to the model at each step
+        prompt_history (N, J, K+1) -- exact prompt fed to the model at each step
     """
     N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
 
     # Draw N random indices without replacement for reproducibility via rng
     selected_indices = rng.choice(len(dataset), size=N, replace=False)
 
-    distributions = np.zeros((N, K + 1, n_classes), dtype=np.float32)
+    distributions = np.zeros((N, J, K + 1, n_classes), dtype=np.float64)
     true_labels = np.zeros(N, dtype=np.int32)
     input_texts: List[str] = []
 
@@ -173,38 +125,45 @@ def run_martingale_check(
     except Exception:
         data_indices = selected_indices.astype(np.int32)
 
-    # Per-question answer history accumulated across iterations
-    history: List[List[str]] = [[] for _ in range(N)]
-    current_prompts = list(initial_prompts)
-    # all_prompts[k] holds the N prompts fed to the model at step k
-    all_prompts: List[List[str]] = []
+    all_run_prompts: List[List[List[str]]] = []  # [j][k] = list of N prompts
 
-    for k in range(K + 1):
-        all_prompts.append(list(current_prompts))
-        logger.info(f"  Iteration k={k}/{K} ...")
-        probs_k = np.zeros((N, n_classes), dtype=np.float32)
+    for j in range(J):
+        logger.info(f"  Trajectory j={j + 1}/{J} ...")
 
-        for start in range(0, N, batch_size):
-            end = min(start + batch_size, N)
-            probs_k[start:end] = get_probs(current_prompts[start:end])
+        # Per-question answer history accumulated across iterations, fresh per trajectory
+        history: List[List[str]] = [[] for _ in range(N)]
+        current_prompts = list(initial_prompts)
+        # traj_prompts[k] holds the N prompts fed to the model at step k
+        traj_prompts: List[List[str]] = []
 
-        distributions[:, k, :] = probs_k
+        for k in range(K + 1):
+            traj_prompts.append(list(current_prompts))
+            logger.info(f"    k={k}/{K} ...")
+            probs_k = np.zeros((N, n_classes), dtype=np.float64)
 
-        if k < K:
-            next_prompts: List[str] = []
-            for i in range(N):
-                # Renormalise to guard against float32 rounding before sampling
-                p = probs_k[i].astype(np.float64)
-                p /= p.sum()
-                sampled_idx = int(rng.choice(n_classes, p=p))
-                history[i].append(label_chars[sampled_idx])
-                next_prompts.append(
-                    _insert_prev_answers(initial_prompts[i], history[i])
-                )
-            current_prompts = next_prompts
+            for start in range(0, N, batch_size):
+                end = min(start + batch_size, N)
+                probs_k[start:end] = get_probs(current_prompts[start:end])
 
-    # Reshape to (N, K+1): all_prompts[k][i] -> prompt_history[i][k]
-    prompt_history = np.array(all_prompts, dtype=object).T  # (N, K+1)
+            distributions[:, j, k, :] = probs_k
+
+            if k < K:
+                next_prompts: List[str] = []
+                for i in range(N):
+                    # Renormalise to guard against float32 rounding before sampling
+                    p = probs_k[i].astype(np.float64)
+                    p /= p.sum()
+                    sampled_idx = int(rng.choice(n_classes, p=p))
+                    history[i].append(label_chars[sampled_idx])
+                    next_prompts.append(
+                        _insert_prev_answers(initial_prompts[i], history[i])
+                    )
+                current_prompts = next_prompts
+
+        all_run_prompts.append(traj_prompts)
+
+    # all_run_prompts[j][k] is a list of N prompts -> transpose to (N, J, K+1)
+    prompt_history = np.array(all_run_prompts, dtype=object).transpose(2, 0, 1)
 
     return {
         "distributions": distributions,
@@ -216,47 +175,65 @@ def run_martingale_check(
 
 
 def run_ppr_check(
-    get_probs: Callable[[List[str]], np.ndarray],
+    get_theta_trajectory: Callable[[List[str]], np.ndarray],
     n_classes: int,
     dataset,
-    K: int,
+    n_ppr_samples: int,
     n_samples: Optional[int],
     rng: np.random.Generator,
     logger,
     label_chars: list,
-    n_ppr_samples: int = 100,
     get_probs_seed: Optional[Callable[[List[str]], np.ndarray]] = None,
     n_seed_answers: int = 0,
     J: int = 1,
 ) -> dict:
-    """PPR variant of the martingale check with optional direct-query seeding and J trajectories.
+    """PPR check following Kim et al.'s Section 4.1 protocol exactly.
 
-    J independent trajectories are run per question to estimate the martingale
-    posterior Law(θ_∞ | x_Q).  Each trajectory is a K-step PPR chain; the J
-    converged distributions (step K of each run) are the posterior samples.
+    For each of J independent trajectories per question:
+      1. (optional) answer seeding: draw n_seed_answers i.i.d. samples from
+         the direct-query distribution (get_probs_seed) and prepend them
+         ONCE to the PPR prompt -- x_tilde_Q = [I; Q; S_1:m]. This is the
+         paper's Section 3/4.1 "answer seeding," not a per-step re-injected
+         belief summary.
+      2. Run ONE continuous PPR generation of n_ppr_samples answers via
+         get_theta_trajectory, which returns theta_n for n=1..n_ppr_samples
+         directly from that single generation (exact per-position logits
+         where available, else the cumulative empirical-frequency MLE --
+         see the individual provider docstrings in model_calls.py).
 
-    Seeding protocol (when get_probs_seed and n_seed_answers are set):
-      - get_probs_seed is called ONCE per question to get the direct-query
-        distribution; n_seed_answers seeds are re-sampled independently for
-        each of the J trajectories so they remain i.i.d.
-      - k=0: question body + direct-query seeds for this trajectory.
-      - k>0: question body + direct-query seeds + PPR samples from step k-1.
+    Unlike earlier versions of this function, there is no round-by-round loop
+    that re-prompts the model with a textual "current belief distribution"
+    summary between steps: the paper's PPR is one uninterrupted generation,
+    and theta_n is read off at every prefix length within it.
 
-    prompt_history records only trajectory j=0 to keep memory bounded.
+    k=0 in the returned `distributions` array is a plain Direct-Query call
+    (no PPR instruction, via get_probs_seed) -- this is the paper's own
+    Direct-Query baseline (used in their Tables 1-2) and keeps this
+    function's output shape compatible with the rest of the pipeline
+    (compute_martingale_metrics etc. expect a "prior" at index 0). It is
+    computed once per question and shared across all J trajectories, same as
+    the seed distribution it doubles as.
 
     Returns
     -------
     dict with keys:
-        distributions  (N, J, K+1, C)
+        distributions  (N, J, n_ppr_samples+1, C) -- k=0 is Direct-Query,
+                        k=1..n_ppr_samples is theta_n from the single PPR
+                        rollout of that trajectory
         true_labels    (N,)
         input_texts    list[str]
         data_indices   (N,)
-        prompt_history (N, J, K+1) -- prompts for every trajectory and step
+        prompt_history (N, J, n_ppr_samples+1) -- k=0 is the direct-query
+                        prompt; k=1..n_ppr_samples all record the SAME single
+                        PPR prompt for that trajectory, since every theta_n
+                        in it comes from one continuous generation, not a
+                        distinct prompt per step
     """
     N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
     selected_indices = rng.choice(len(dataset), size=N, replace=False)
 
-    distributions = np.zeros((N, J, K + 1, n_classes), dtype=np.float32)
+    K = n_ppr_samples
+    distributions = np.zeros((N, J, K + 1, n_classes), dtype=np.float64)
     true_labels = np.zeros(N, dtype=np.int32)
     input_texts: List[str] = []
     initial_prompts: List[str] = []
@@ -275,60 +252,57 @@ def run_ppr_check(
     except Exception:
         data_indices = selected_indices.astype(np.int32)
 
-    # Direct-query seed distribution: one call per question, shared across all J runs.
-    # Each run re-samples its own n_seed_answers labels so the J trajectories are i.i.d.
-    seed_dist: Optional[np.ndarray] = None
-    if get_probs_seed is not None and n_seed_answers > 0:
-        logger.info(
-            f"  Direct-query seeding: {n_seed_answers} seeds × {J} trajectories ..."
+    # Direct-Query baseline (k=0): one call per question, shared across all J
+    # trajectories. Doubles as the distribution answer seeds are drawn from,
+    # matching the paper's S_1:m ~ p_phi(.|Q) (Section 4.1).
+    logger.info("  Direct-Query baseline (k=0) ...")
+    if get_probs_seed is not None:
+        direct_probs = get_probs_seed(input_texts)  # (N, n_classes)
+    else:
+        direct_probs = np.full((N, n_classes), 1.0 / n_classes, dtype=np.float64)
+        logger.warning(
+            "  No get_probs_seed provided; k=0 Direct-Query baseline left "
+            "uniform. Pass a direct-query provider to populate it."
         )
-        seed_dist = get_probs_seed(input_texts)  # (N, n_classes)
+    distributions[:, :, 0, :] = direct_probs[:, None, :]
 
     def _make_ppr_prompt(body: str, seeds: List[str]) -> str:
         return _insert_prev_answers_ppr(body, seeds) if seeds else body
 
-    all_run_prompts: List[List[List[str]]] = []  # [j][k] = list of N prompts
+    direct_query_prompts = list(input_texts)
+    ppr_prompts_by_traj: List[List[str]] = []  # [j] -> list of N PPR prompts
 
     for j in range(J):
         logger.info(f"  Trajectory j={j + 1}/{J} ...")
 
-        # Re-sample seeds independently for each trajectory
-        direct_seeds_j: List[List[str]] = [[] for _ in range(N)]
-        if seed_dist is not None:
+        # Answer seeding (Section 3/4.1): m i.i.d. direct-query samples,
+        # re-sampled independently per trajectory so the J rollouts stay
+        # i.i.d., prepended ONCE before the single PPR generation.
+        seeds_j: List[List[str]] = [[] for _ in range(N)]
+        if n_seed_answers > 0:
             for i in range(N):
-                p = seed_dist[i].astype(np.float64)
+                p = direct_probs[i].astype(np.float64)
                 p /= p.sum()
                 idxs = rng.choice(n_classes, size=n_seed_answers, p=p)
-                direct_seeds_j[i] = [label_chars[idx] for idx in idxs]
+                seeds_j[i] = [label_chars[idx] for idx in idxs]
 
-        current_prompts = [
-            _make_ppr_prompt(initial_prompts[i], direct_seeds_j[i]) for i in range(N)
-        ]
+        ppr_prompts = [_make_ppr_prompt(initial_prompts[i], seeds_j[i]) for i in range(N)]
+        ppr_prompts_by_traj.append(ppr_prompts)
 
-        traj_prompts: List[List[str]] = []
-        accumulated_ppr_seeds: List[List[str]] = [[] for _ in range(N)]
-        for k in range(K + 1):
-            traj_prompts.append(list(current_prompts))
-            logger.info(f"    k={k}/{K} ...")
-            probs_k = get_probs(current_prompts)
-            distributions[:, j, k, :] = probs_k
+        logger.info(f"    Single PPR generation (N={n_ppr_samples} answers) ...")
+        theta_traj = get_theta_trajectory(ppr_prompts)  # (N, n_ppr_samples, C)
+        distributions[:, j, 1:, :] = theta_traj
 
-            if k < K:
-                next_prompts: List[str] = []
-                for i in range(N):
-                    p = probs_k[i].astype(np.float64)
-                    p /= p.sum()
-                    accumulated_ppr_seeds[i].append(label_chars[int(np.argmax(p))])
-                    combined = direct_seeds_j[i] + accumulated_ppr_seeds[i]
-                    next_prompts.append(
-                        _insert_prev_answers_ppr(initial_prompts[i], combined, label_chars=label_chars, prompt_dist=p)
-                    )
-                current_prompts = next_prompts
-
-        all_run_prompts.append(traj_prompts)
-
-    # all_run_prompts[j][k] is a list of N prompts -> transpose to (N, J, K+1)
-    prompt_history = np.array(all_run_prompts, dtype=object).transpose(2, 0, 1)
+    # Build (N, J, K+1) prompt history: k=0 is the direct-query prompt, and
+    # k=1..K all record the single PPR prompt for that (question, trajectory)
+    # -- there is genuinely only one prompt per trajectory, since the whole
+    # theta_1..theta_K trajectory comes from one continuous generation.
+    prompt_history = np.empty((N, J, K + 1), dtype=object)
+    for j in range(J):
+        for i in range(N):
+            prompt_history[i, j, 0] = direct_query_prompts[i]
+            for k in range(1, K + 1):
+                prompt_history[i, j, k] = ppr_prompts_by_traj[j][i]
 
     return {
         "distributions": distributions,   # (N, J, K+1, C)
@@ -337,107 +311,6 @@ def run_ppr_check(
         "data_indices": data_indices,
         "prompt_history": prompt_history,
     }
-
-def run_retrieval_check(
-    get_probs: Callable[[List[str]], np.ndarray],
-    generate_text: Callable[[List[str]], List[str]],
-    n_classes: int,
-    dataset,
-    train_dataset,
-    m: int,
-    J: int,
-    n_samples: Optional[int],
-    rng: np.random.Generator,
-    logger,
-    label_chars: list,
-    n_shots: int = 4,
-    embedding_model: str = "all-MiniLM-L6-v2",
-) -> dict:
-    """Scenario 2 imputation check (Falck et al., ICML 2024).
-
-    For each test question:
-      - Retrieves n_shots semantically similar training examples as the
-        few-shot context D.
-      - For each of J independent repetitions:
-          1. Autoregressively generates m synthetic Q&A pairs extending D.
-          2. Predicts on x_{n+1} conditioned on D + imputed pairs (single call).
-    The J distributions are martingale posterior samples.
-
-    Returns distributions of shape (N, J, 1, C).
-    """
-    retriever = SimilarQuestionRetriever(embedding_model)
-    retriever.build_index(train_dataset, label_chars, logger=logger)
-
-    N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
-    selected_indices = rng.choice(len(dataset), size=N, replace=False)
-
-    distributions = np.zeros((N, J, 1, n_classes), dtype=np.float32)
-    true_labels = np.zeros(N, dtype=np.int32)
-    input_texts: List[str] = []
-
-    # Build D (retrieved few-shots) and target body for each question
-    d_contexts: List[str] = []
-    target_bodies: List[str] = []
-    logger.info(f"  Retrieving {n_shots} few-shot examples per question ...")
-    for i, dataset_idx in enumerate(selected_indices):
-        sample = dataset[int(dataset_idx)]
-        input_texts.append(sample["prompt"])
-        true_labels[i] = int(sample["label"])
-        target_body = _strip_answer_suffix(sample["prompt"])
-        few_shots = retriever.retrieve(target_body, n_shots)
-        d_context = "\n\n".join(f"{body}\nAnswer: {ans}" for body, ans in few_shots)
-        d_contexts.append(d_context)
-        target_bodies.append(target_body)
-
-    try:
-        all_row_ids = dataset.get_data_indices()
-        data_indices = np.array(
-            [all_row_ids[int(idx)] for idx in selected_indices], dtype=np.int32
-        )
-    except Exception:
-        data_indices = selected_indices.astype(np.int32)
-
-    all_run_prompts: List[List[List[str]]] = []
-
-    for j in range(J):
-        logger.info(f"  Trajectory j={j + 1}/{J} ...")
-
-        # Each trajectory starts fresh from the retrieved D
-        imputed_contexts = list(d_contexts)
-
-        # Autoregressively generate m synthetic Q&A pairs extending D
-        for step in range(m):
-            logger.info(f"    Imputation step {step + 1}/{m} ...")
-            imputation_prompts = [
-                _build_imputation_prompt(ctx) for ctx in imputed_contexts
-            ]
-            generated = generate_text(imputation_prompts)
-            imputed_contexts = [
-                f"{ctx}\n\n{_clean_generated_qa(gen) or gen.strip()}"
-                for ctx, gen in zip(imputed_contexts, generated)
-            ]
-
-        # Single prediction: D + imputed pairs + x_{n+1}
-        prediction_prompts = [
-            f"{ctx}\n\n{target}{_ANSWER_SUFFIX}"
-            for ctx, target in zip(imputed_contexts, target_bodies)
-        ]
-        logger.info(f"    Predicting on x_{{n+1}} ...")
-        probs = get_probs(prediction_prompts)
-        distributions[:, j, 0, :] = probs
-        all_run_prompts.append([prediction_prompts])
-
-    # shape: (N, J, 1)
-    prompt_history = np.array(all_run_prompts, dtype=object).transpose(2, 0, 1)
-
-    return {
-        "distributions": distributions,
-        "true_labels": true_labels,
-        "input_texts": input_texts,
-        "data_indices": data_indices,
-        "prompt_history": prompt_history,
-    }
-
 
 
 # ---------------------------------------------------------------------------
