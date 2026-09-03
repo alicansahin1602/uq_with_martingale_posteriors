@@ -1,0 +1,4 @@
+_base_: ['../_base_/sciq.yaml', '../_base_/gemini-2.5-flash.yaml', '../_base_/misc.yaml']
+
+process_preds:
+    npz_file: "sciq.npz"

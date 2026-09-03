@@ -68,32 +68,6 @@ You must follow the output format and the generating rules!\
 """
 
 
-def imputation_system_prompt() -> str:
-    """System prompt for the imputation step of Scenario 2.
-
-    Instructs the model to generate exactly one new multiple-choice Q&A pair
-    that continues the provided sequence in the same topic and style.
-    """
-    return """\
-You are a question generation assistant. Your task is to extend a sequence of \
-multiple-choice questions by writing exactly ONE new question-and-answer pair \
-in the same topic, style, and difficulty as the examples provided.
-
-OUTPUT FORMAT
--------------
-Write the new question in exactly the same format as the examples shown. \
-Include the question text, the labeled answer choices (A, B, C, …), and \
-a final line "Answer: <letter>" giving the correct answer.
-
-RULES
------
-- Generate exactly one new question-and-answer pair.
-- Match the topic, style, and difficulty of the example questions.
-- Do not repeat any question already in the sequence.
-- Do not include any explanation or additional text beyond the question block.\
-"""
-
-
 def mcqa_system_prompt(n_class: int) -> str:
     """Build a system prompt for a multiple-choice question-answering assistant.
 
@@ -144,10 +118,10 @@ PREVIOUS ANSWERS
 ----------------
 Some questions may include a line of the form:
 
-    Your previous answers were: <label>, <label>, ...
+    Your prior answers in previous steps to this specific question were: <label>, <label>, ...
 
 This line records the answers that were given to the same question in \
-earlier rounds of this session. It is provided as factual context about \
+earlier rounds of this session by yourself. It is provided as factual context about \
 what was answered before. Answer each question on its own merits based on \
 the question text and the answer choices — do not let the presence or \
 absence of a previous-answer history change how carefully you reason about \

@@ -1,0 +1,5 @@
+api_model:
+    provider: "google"
+    model_name: "gemini-2.5-flash"
+    use_logprobs: true
+    n_api_samples: null
