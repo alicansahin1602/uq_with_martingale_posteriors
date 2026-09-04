@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import List, Callable, Optional
+from typing import List, Callable, Optional, Tuple
 import re
 import transformers
 import numpy as np
@@ -51,6 +51,9 @@ def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
         Your previous answers were: A, C, B
         Answer:
     """
+    if not prev_labels:
+        return initial_prompt
+    
     if not initial_prompt.endswith(_ANSWER_SUFFIX):
         raise ValueError(
             f"Prompt does not end with '{_ANSWER_SUFFIX}'. "
@@ -59,6 +62,291 @@ def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
     body = initial_prompt[: -len(_ANSWER_SUFFIX)]
     history = ", ".join(prev_labels)
     return f"{body}\nYour prior answers in previous steps to this specific question were: {history}{_ANSWER_SUFFIX}"
+
+
+def _call_martingale_sampling_get_probs(
+    get_probs: Callable[[List[str]], Tuple[np.ndarray, np.ndarray]],
+    prompts: List[str],
+    n_classes: int,
+    batch_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Call and validate the provider used by ``martingale_sampling``.
+
+    The dedicated provider returns ``(class_logits, probabilities)``.  OpenAI
+    exposes log probabilities rather than pre-softmax logits, so its provider
+    returns logit-equivalent class scores; see the provider docstring in
+    ``model_calls.py``.  Keeping both arrays lets the experiment retain the
+    uncentred scores and use exactly the same probability extraction for main
+    and hypothetical branch prompts.
+    """
+    if not prompts:
+        empty = np.empty((0, n_classes), dtype=np.float64)
+        return empty.copy(), empty
+
+    logits_parts = []
+    probs_parts = []
+    for start in range(0, len(prompts), batch_size):
+        result = get_probs(prompts[start : start + batch_size])
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise TypeError(
+                "martingale_sampling get_probs must return "
+                "(class_logits, probabilities)."
+            )
+        logits_part, probs_part = (np.asarray(x, dtype=np.float64) for x in result)
+        expected_shape = (min(batch_size, len(prompts) - start), n_classes)
+        if logits_part.shape != expected_shape or probs_part.shape != expected_shape:
+            raise ValueError(
+                "martingale_sampling provider returned invalid shapes: "
+                f"logits={logits_part.shape}, probs={probs_part.shape}, "
+                f"expected={expected_shape}."
+            )
+        logits_parts.append(logits_part)
+        probs_parts.append(probs_part)
+
+    logits = np.concatenate(logits_parts, axis=0)
+    probs = np.concatenate(probs_parts, axis=0)
+    if not np.all(np.isfinite(logits)) or not np.all(np.isfinite(probs)):
+        raise ValueError("martingale_sampling provider returned non-finite values.")
+    if np.any(probs < 0.0):
+        raise ValueError("martingale_sampling probabilities must be non-negative.")
+
+    # Only correct harmless floating-point drift. A zero-mass row is a real
+    # provider error and should stop the experiment instead of becoming NaNs.
+    row_sums = probs.sum(axis=1, keepdims=True)
+    if np.any(row_sums <= 0.0):
+        raise ValueError("martingale_sampling probability rows must have positive mass.")
+    probs = probs / row_sums
+    return logits, probs
+
+
+def run_martingale_sampling_check(
+    get_probs: Callable[[List[str]], Tuple[np.ndarray, np.ndarray]],
+    n_classes: int,
+    dataset,
+    rng: np.random.Generator,
+    K: int = 100,
+    n_samples: Optional[int] = 5,
+    batch_size: int = 1,
+    seed: int = 42,
+    logger=None,
+    label_chars: Optional[List[str]] = None,
+    J: int = 20,
+) -> dict:
+    """Run the exact local branching martingale-consistency experiment.
+
+    At every visited history this function evaluates all ``n_classes``
+    possible one-label continuations.  It then computes
+
+        sum_y p_t[y] * p_{t+1}^{(y)} - p_t
+
+    exactly and samples one label from ``p_t`` to continue only that branch.
+    The selected branch's scores are cached and reused at the next main step,
+    so a prompt is never queried twice within one trajectory.
+
+    Parameters follow the notation in ``martingale_consistency_experiment.md``:
+    ``n_samples`` is Q, ``R`` is the number of independent replications, and
+    ``K`` is the number of stored prediction steps (there are K-1 transitions).
+
+    The returned tensors have shapes ``(Q, R, K, C)`` for ``logits``/``probs``
+    and ``(Q, R, K-1, C, C)`` for branch tensors.  Class indices, exact prompts,
+    per-(question, replication) seeds, residuals, scalar residual norms,
+    entropy, centred logits, and JSD from the initial distribution are also
+    retained for reproducibility and downstream plotting.
+    """
+    if K < 1:
+        raise ValueError("K must be at least 1.")
+    if J < 1:
+        raise ValueError("J must be at least 1.")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
+    if n_classes < 2:
+        raise ValueError("n_classes must be at least 2.")
+    if label_chars is None:
+        label_chars = [chr(ord("A") + i) for i in range(n_classes)]
+    if len(label_chars) != n_classes or len(set(label_chars)) != n_classes:
+        raise ValueError("label_chars must contain one unique label per class.")
+
+    Q = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
+    selected_indices = rng.choice(len(dataset), size=Q, replace=False)
+
+    logits = np.zeros((Q, J, K, n_classes), dtype=np.float64)
+    probs = np.zeros_like(logits)
+    labels = np.full((Q, J, max(K - 1, 0)), -1, dtype=np.int32)
+    branch_logits = np.zeros(
+        (Q, J, max(K - 1, 0), n_classes, n_classes), dtype=np.float64
+    )
+    branch_probs = np.zeros_like(branch_logits)
+    expected_next = np.zeros((Q, J, max(K - 1, 0), n_classes), dtype=np.float64)
+    residuals = np.zeros_like(expected_next)
+    error_l1 = np.zeros((Q, J, max(K - 1, 0)), dtype=np.float64)
+    error_l2 = np.zeros_like(error_l1)
+    error_max = np.zeros_like(error_l1)
+    prompt_history = np.empty((Q, J, K), dtype=object)
+    branch_prompt_history = np.empty(
+        (Q, J, max(K - 1, 0), n_classes), dtype=object
+    )
+    trajectory_seeds = np.zeros((Q, J), dtype=np.uint64)
+    true_labels = np.zeros(Q, dtype=np.int32)
+    input_texts: List[str] = []
+    initial_prompts: List[str] = []
+
+    for q, dataset_idx in enumerate(selected_indices):
+        sample = dataset[int(dataset_idx)]
+        initial_prompts.append(sample["prompt"])
+        input_texts.append(sample["prompt"])
+        true_labels[q] = int(sample["label"])
+
+    try:
+        all_row_ids = dataset.get_data_indices()
+        data_indices = np.array(
+            [all_row_ids[int(idx)] for idx in selected_indices], dtype=np.int32
+        )
+    except Exception:
+        data_indices = selected_indices.astype(np.int32)
+
+    # p_0 is identical across replications for a question. Query it once and
+    # copy it into each independent trajectory, saving (R-1) calls per question.
+    initial_logits, initial_probs = _call_martingale_sampling_get_probs(
+        get_probs, initial_prompts, n_classes, batch_size
+    )
+
+    for q in range(Q):
+        for j in range(J):
+            # SeedSequence makes the mapping explicit and stable: changing one
+            # trajectory does not consume random numbers belonging to another.
+            trajectory_seed = np.random.SeedSequence(
+                [int(seed), int(selected_indices[q]), j]
+            ).generate_state(1, dtype=np.uint64)[0]
+            trajectory_seeds[q, j] = trajectory_seed
+            trajectory_rng = np.random.default_rng(trajectory_seed)
+            history: List[str] = []
+
+            current_prompt = initial_prompts[q]
+            current_logits = initial_logits[q]
+            current_probs = initial_probs[q]
+
+            if logger is not None:
+                logger.info(
+                    f"  martingale_sampling q={q + 1}/{Q}, j={j + 1}/{J}, "
+                    f"seed={int(trajectory_seed)}"
+                )
+
+            for k in range(K):
+                # At t>0 these values are the cached row from the branch matrix
+                # selected at t-1; no duplicate provider request is necessary.
+                logits[q, j, k] = current_logits
+                probs[q, j, k] = current_probs
+                prompt_history[q, j, k] = current_prompt
+
+                if k == K - 1:
+                    break
+
+                # Every branch starts from this exact history and differs only
+                # in the single hypothetical label appended to it.
+                local_branch_prompts = [
+                    _insert_prev_answers(
+                        initial_prompts[q], history + [label_chars[y]]
+                    )
+                    for y in range(n_classes)
+                ]
+                local_branch_logits, local_branch_probs = (
+                    _call_martingale_sampling_get_probs(
+                        get_probs,
+                        local_branch_prompts,
+                        n_classes,
+                        batch_size,
+                    )
+                )
+                branch_logits[q, j, k] = local_branch_logits
+                branch_probs[q, j, k] = local_branch_probs
+                branch_prompt_history[q, j, k] = local_branch_prompts
+
+                # Direct categorical continuation means the weighting
+                # distribution q_t is exactly the model distribution p_t.
+                local_expected_next = current_probs @ local_branch_probs
+                local_residual = local_expected_next - current_probs
+                expected_next[q, j, k] = local_expected_next
+                residuals[q, j, k] = local_residual
+                error_l1[q, j, k] = np.abs(local_residual).sum()
+                error_l2[q, j, k] = np.linalg.norm(local_residual)
+                error_max[q, j, k] = np.abs(local_residual).max()
+
+                sampled_idx = int(
+                    trajectory_rng.choice(n_classes, p=current_probs)
+                )
+                labels[q, j, k] = sampled_idx
+                history.append(label_chars[sampled_idx])
+
+                # Continue only the sampled branch and reuse its already
+                # evaluated distribution/logit-equivalent scores.
+                current_prompt = local_branch_prompts[sampled_idx]
+                current_logits = local_branch_logits[sampled_idx]
+                current_probs = local_branch_probs[sampled_idx]
+
+    centered_logits = logits - logits.mean(axis=-1, keepdims=True)
+    safe_probs = np.clip(probs, 1e-300, 1.0)
+    entropy = -(probs * np.log(safe_probs)).sum(axis=-1)
+    initial = probs[:, :, 0:1, :]
+    mixture = 0.5 * (probs + initial)
+    safe_mixture = np.clip(mixture, 1e-300, 1.0)
+    js_from_initial = 0.5 * (
+        (probs * (np.log(safe_probs) - np.log(safe_mixture))).sum(axis=-1)
+        + (
+            initial
+            * (
+                np.log(np.clip(initial, 1e-300, 1.0))
+                - np.log(safe_mixture)
+            )
+        ).sum(axis=-1)
+    )
+
+    metadata = dict(
+        getattr(get_probs, "martingale_sampling_metadata", {})
+    )
+    metadata.update(
+        {
+            "experiment": "martingale_sampling",
+            "base_seed": int(seed),
+            "Q": int(Q),
+            "J": int(J),
+            "K": int(K),
+            "C": int(n_classes),
+            "label_chars": list(label_chars),
+            "prompt_history_template": "<initial prompt body>\\nYour previous answers: <comma-separated labels>\\nAnswer:",
+            "sampling_rule": "numpy.random.Generator.choice(C, p=p_t)",
+            "dtype": str(probs.dtype),
+        }
+    )
+
+    return {
+        "logits": logits,
+        "probs": probs,
+        # Alias makes the result convenient for older analysis utilities while
+        # keeping the specification's clearer `probs` name.
+        "distributions": probs,
+        "labels": labels,
+        "label_history": np.asarray(label_chars, dtype=object)[labels]
+        if K > 1
+        else np.empty(labels.shape, dtype=object),
+        "branch_logits": branch_logits,
+        "branch_probs": branch_probs,
+        "expected_next": expected_next,
+        "residuals": residuals,
+        "error_l1": error_l1,
+        "error_l2": error_l2,
+        "error_max": error_max,
+        "centered_logits": centered_logits,
+        "entropy": entropy,
+        "js_from_initial": js_from_initial,
+        "true_labels": true_labels,
+        "input_texts": input_texts,
+        "data_indices": data_indices,
+        "selected_dataset_indices": selected_indices.astype(np.int32),
+        "trajectory_seeds": trajectory_seeds,
+        "prompt_history": prompt_history,
+        "branch_prompt_history": branch_prompt_history,
+        "metadata": metadata,
+    }
 
 # ---------------------------------------------------------------------------
 # Running martingale checks for different methods
@@ -316,6 +604,60 @@ def run_ppr_check(
 # ---------------------------------------------------------------------------
 # Computing metrics
 # ---------------------------------------------------------------------------
+def compute_martingale_sampling_metrics(result: dict) -> dict:
+    """Aggregate the local diagnostics returned by martingale sampling.
+
+    Local residuals remain the primary test. The global drift below is only
+    a complementary consequence of a martingale: across independent
+    replications, the mean p_t should remain close to the common p_0.
+    """
+    required = ("probs", "residuals", "error_l1", "error_l2", "error_max")
+    missing = [key for key in required if key not in result]
+    if missing:
+        raise KeyError(f"martingale_sampling result is missing: {missing}")
+
+    probs = np.asarray(result["probs"], dtype=np.float64)
+    residuals = np.asarray(result["residuals"], dtype=np.float64)
+    error_l1 = np.asarray(result["error_l1"], dtype=np.float64)
+    error_l2 = np.asarray(result["error_l2"], dtype=np.float64)
+    error_max = np.asarray(result["error_max"], dtype=np.float64)
+    if probs.ndim != 4:
+        raise ValueError("result['probs'] must have shape (Q, R, T, C).")
+
+    # Average local errors across questions and independent replications while
+    # retaining question-level profiles for confidence intervals/plots.
+    mean_error_l1_by_step = error_l1.mean(axis=(0, 1))
+    mean_error_l2_by_step = error_l2.mean(axis=(0, 1))
+    mean_error_max_by_step = error_max.mean(axis=(0, 1))
+    mean_signed_residual_by_step = residuals.mean(axis=(0, 1))
+
+    replication_mean_probs = probs.mean(axis=1)  # (Q, T, C)
+    initial_probs = probs[:, 0, 0, :]            # common p_0 for each question
+    global_drift_from_initial = replication_mean_probs - initial_probs[:, None, :]
+    global_l1_drift_by_question_step = np.abs(global_drift_from_initial).sum(axis=-1)
+
+    true_labels = result.get("true_labels")
+    accuracy_at_p0 = None
+    if true_labels is not None:
+        true_labels = np.asarray(true_labels)
+        accuracy_at_p0 = float((initial_probs.argmax(axis=-1) == true_labels).mean())
+
+    return {
+        "mean_error_l1": float(error_l1.mean()),
+        "mean_error_l2": float(error_l2.mean()),
+        "mean_error_max": float(error_max.mean()),
+        "mean_error_l1_by_step": mean_error_l1_by_step,
+        "mean_error_l2_by_step": mean_error_l2_by_step,
+        "mean_error_max_by_step": mean_error_max_by_step,
+        "mean_signed_residual_by_step": mean_signed_residual_by_step,
+        "mean_error_l1_by_question_step": error_l1.mean(axis=1),
+        "mean_error_l2_by_question_step": error_l2.mean(axis=1),
+        "global_drift_from_initial": global_drift_from_initial,
+        "global_l1_drift_by_question_step": global_l1_drift_by_question_step,
+        "accuracy_at_p0": accuracy_at_p0,
+    }
+
+
 def compute_martingale_metrics(distributions: np.ndarray, true_labels: np.ndarray) -> dict:
     """Compute drift statistics from the full distribution trajectory.
 
@@ -431,6 +773,37 @@ def compute_martingale_posterior_metrics(distributions: np.ndarray) -> dict:
 # ---------------------------------------------------------------------------
 # Saving results
 # ---------------------------------------------------------------------------
+
+def save_martingale_sampling_results(
+    work_dir: str,
+    result: dict,
+    logger=None,
+    filename: str = "martingale_sampling_results.npz",
+) -> str:
+    """Save every reproducibility tensor from ``run_martingale_sampling_check``.
+
+    Metadata is stored as an object scalar, matching the repository's existing
+    NumPy result format. Load with ``np.load(path, allow_pickle=True)``.
+    """
+    mmengine.mkdir_or_exist(work_dir)
+    out_path = osp.join(work_dir, filename)
+
+    # Save all returned values rather than maintaining a second hand-written
+    # field list that could silently omit a newly added diagnostic.
+    payload = {}
+    for key, value in result.items():
+        if isinstance(value, dict):
+            payload[key] = np.array(value, dtype=object)
+        elif isinstance(value, list):
+            payload[key] = np.array(value, dtype=object)
+        else:
+            payload[key] = value
+    np.savez_compressed(out_path, **payload)
+
+    if logger is not None:
+        logger.info(f"Martingale-sampling results saved to {out_path}")
+    return out_path
+
 
 def save_martingale_results(
     work_dir: str,

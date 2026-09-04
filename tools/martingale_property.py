@@ -60,9 +60,12 @@ from martingale_consistency_and_posteriors import (
      run_ppr_check,
      compute_emd_metrics,
      compute_martingale_posterior_metrics,
+     _build_openai_martingale_sampling_provider,
+     run_martingale_sampling_check
 )
 import os
 from dotenv import load_dotenv, find_dotenv
+
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -99,9 +102,10 @@ def parse_args():
                    help="Override config values, e.g. model.use_peft=False.")
 
     # PPR / retrieval mode
-    p.add_argument("--mode", default="iterative", choices=["iterative", "ppr"],
+    p.add_argument("--mode", default="iterative", choices=["iterative", "ppr", "sampling"],
                    help="'iterative': one call per step (existing); "
-                        "'ppr': single call generates N i.i.d. samples (PPR); ")
+                        "'ppr': single call generates N i.i.d. samples (PPR); "
+                        "'sampling': use sampling for probability estimation.")
 
     p.add_argument("--n-ppr-samples", type=int, default=100,
                    help="Length N of the single continuous PPR generation (the paper's "
@@ -276,6 +280,19 @@ def main():
             f"use_logprobs={ppr_use_logprobs if provider != 'anthropic' else 'N/A (empirical frequency)'}"
         )
 
+    elif args.mode == "sampling":
+        if provider == "openai":
+            get_probs = _build_openai_martingale_sampling_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                use_logprobs=api_cfg.get("use_logprobs", False),
+                n_api_samples=n_api_samples,
+                api=os.getenv("OPENAI_API_KEY"),
+                raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
+            )
+        else:
+            raise ValueError(f"Sampling mode is only supported for OpenAI provider, not '{provider}'.")
+
     else:
         if provider == "openai":
             get_probs = _build_openai_provider(
@@ -395,6 +412,20 @@ def main():
             J=args.J,
         )
 
+    elif args.mode == "sampling":
+        result = run_martingale_sampling_check(
+            get_probs=get_probs,
+            n_classes=n_classes,
+            dataset=dataset,
+            K=args.K,
+            n_samples=args.n_samples,
+            batch_size=batch_size if batch_size else 1,
+            rng=rng,
+            logger=logger,
+            label_chars=label_chars,
+            J=args.J,
+            seed =args.seed
+        )
     else:
         result = run_martingale_check(
             get_probs=get_probs,
