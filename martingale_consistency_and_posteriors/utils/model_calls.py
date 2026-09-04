@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import openai
 import anthropic
 
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 from openai import PermissionDeniedError
 from .system_prompt import mcqa_system_prompt, ppr_system_prompt
 
@@ -117,6 +117,91 @@ def _first_label_probs(content, label_chars: List[str]) -> np.ndarray:
         if tok in label_set:
             return _label_probs_from_top_logprobs(entry.top_logprobs, label_chars)
     return _label_probs_from_top_logprobs(content[0].top_logprobs, label_chars)
+
+
+def _martingale_sampling_label_logits_and_probs(
+    top_logprobs,
+    label_chars: List[str],
+    missing_probability: float = 1e-10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract class scores and probabilities for martingale sampling.
+
+    OpenAI does not expose raw pre-softmax logits. It exposes token
+    log-probabilities, which equal logits up to a shared additive constant.
+    We therefore retain one log-probability score per class as the experiment's
+    ``logits`` tensor and softmax those same scores to obtain ``p_t``.
+
+    Several token spellings can represent one class (``"A"``, ``" A"``,
+    ``"a"``). Their masses are combined with logsumexp. A class omitted from
+    the API's truncated ``top_logprobs`` list receives a documented finite
+    floor so centered-score diagnostics remain defined.
+    """
+    if not 0.0 < missing_probability < 1.0:
+        raise ValueError("missing_probability must lie strictly between 0 and 1.")
+
+    label_set = set(label_chars)
+    logprobs_by_label = {label: [] for label in label_chars}
+    for token_info in top_logprobs or []:
+        token = token_info.token.strip().strip(".,:;)").upper()
+        if token in label_set:
+            logprobs_by_label[token].append(float(token_info.logprob))
+
+    class_scores = np.full(
+        len(label_chars), np.log(missing_probability), dtype=np.float64
+    )
+    for class_idx, label in enumerate(label_chars):
+        values = logprobs_by_label[label]
+        if values:
+            # Stable logsumexp sums the probability mass of all spellings.
+            maximum = max(values)
+            class_scores[class_idx] = maximum + np.log(
+                np.exp(np.asarray(values, dtype=np.float64) - maximum).sum()
+            )
+
+    shifted = class_scores - class_scores.max()
+    probabilities = np.exp(shifted)
+    probabilities /= probabilities.sum()
+    return class_scores, probabilities
+
+
+def _first_martingale_sampling_logits_and_probs(
+    content,
+    label_chars: List[str],
+    missing_probability: float = 1e-10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Use the first answer-token position carrying MCQA class scores.
+
+    Prefer a position whose emitted token is itself a class label. If a model
+    emits punctuation or reasoning first, fall back to the first position
+    whose top-logprob alternatives contain at least one class. Unlike the old
+    iterative path, this formal experiment fails loudly when no class scores
+    are available instead of silently inserting a uniform distribution.
+    """
+    if not content:
+        raise ValueError("OpenAI returned no logprob content for martingale_sampling.")
+
+    label_set = set(label_chars)
+    for entry in content:
+        emitted = entry.token.strip().strip(".,:;)").upper()
+        if emitted in label_set:
+            return _martingale_sampling_label_logits_and_probs(
+                entry.top_logprobs, label_chars, missing_probability
+            )
+
+    for entry in content:
+        alternatives = {
+            token_info.token.strip().strip(".,:;)").upper()
+            for token_info in (entry.top_logprobs or [])
+        }
+        if alternatives & label_set:
+            return _martingale_sampling_label_logits_and_probs(
+                entry.top_logprobs, label_chars, missing_probability
+            )
+
+    raise ValueError(
+        "Could not find any MCQA class token in OpenAI top_logprobs for "
+        "martingale_sampling. Inspect the raw response log and prompt."
+    )
 
 
 def _parse_ppr_response_votes(text: str, label_chars: List[str], N: int = 100) -> np.ndarray:
@@ -234,7 +319,7 @@ def _extract_ppr_trajectory_from_logprob_content(
 #        return F.softmax(logits.float(), dim=-1).cpu().numpy()
 #    return get_probs
 
-def _build_openai_provider(
+def _build_hf_provider(
     model_name: str,
     label_chars: List[str],
     use_logprobs: bool,
@@ -242,7 +327,7 @@ def _build_openai_provider(
     api: str = None,
     raw_log_path: Optional[str] = None,
 ) -> Callable[[List[str]], np.ndarray]:
-    """OpenAI provider.
+    """HuggingFace provider.
 
     use_logprobs=True  — one API call per prompt using top_logprobs (fast, exact).
     use_logprobs=False — n_api_samples calls per prompt using temperature sampling.
@@ -421,6 +506,126 @@ def _build_openai_provider(
                 probs[i] = counts / counts.sum()
         return probs
 
+    return get_probs
+
+
+def _build_openai_martingale_sampling_provider(
+    model_name: str,
+    label_chars: List[str],
+    api: str = None,
+    raw_log_path: Optional[str] = None,
+    temperature: float = 0.5,
+    missing_probability: float = 1e-10,
+) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+    """Build the OpenAI scorer for the exact branching experiment.
+
+    The returned ``get_probs(prompts)`` callable returns a pair:
+
+    - class_scores: ``(batch, C)`` OpenAI token log-probability scores
+    - probabilities: ``(batch, C)`` softmax-normalized class probabilities
+
+    OpenAI's API does not provide raw logits. Token log probabilities are
+    logit-equivalent up to a shared additive constant, so they preserve all
+    centered-logit comparisons requested by the experiment. Scores for labels
+    omitted by the truncated top-20 response use ``missing_probability`` as a
+    finite floor; that limitation is recorded in the callable's metadata.
+
+    Sampling the trajectory is deliberately *not* delegated to OpenAI. The
+    runner uses ``numpy.random.Generator.choice`` directly on the returned
+    five-class vector, making the actual continuation distribution q_t=p_t.
+    """
+    if len(label_chars) > 20:
+        raise ValueError(
+            "OpenAI supports at most 20 top_logprobs; this provider cannot "
+            "score more than 20 classes consistently."
+        )
+
+    client = openai.OpenAI(api_key=api)
+    n_classes = len(label_chars)
+
+    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
+        probabilities = np.zeros_like(class_scores)
+
+        for prompt_index, prompt in enumerate(prompts):
+            try:
+                response = _retry_with_backoff(
+                    lambda: client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": mcqa_system_prompt(n_classes),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        logprobs=True,
+                        top_logprobs=20,
+                        temperature=temperature,
+                    )
+                )
+            except PermissionDeniedError as error:
+                print("status_code:", getattr(error, "status_code", None))
+                print("message:", str(error))
+                print("body:", getattr(error, "body", None))
+                raise
+
+            choice = response.choices[0]
+            content = choice.logprobs.content if choice.logprobs else None
+            scores_i, probs_i = _first_martingale_sampling_logits_and_probs(
+                content,
+                label_chars,
+                missing_probability=missing_probability,
+            )
+            class_scores[prompt_index] = scores_i
+            probabilities[prompt_index] = probs_i
+
+            _log_raw_response(
+                raw_log_path,
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "provider": "openai_martingale_sampling",
+                    "model_name": model_name,
+                    "prompt_index": prompt_index,
+                    "prompt": prompt,
+                    "temperature": temperature,
+                    "top_logprobs": 20,
+                    "missing_probability": missing_probability,
+                    "finish_reason": choice.finish_reason,
+                    "message_content": choice.message.content or "",
+                    "class_logprob_scores": scores_i.tolist(),
+                    "resulting_probs": probs_i.tolist(),
+                    "raw_response": response.model_dump()
+                    if hasattr(response, "model_dump")
+                    else str(response),
+                },
+            )
+
+        return class_scores, probabilities
+
+    # The runner copies this into the saved result so the class-scoring and
+    # decoding choices travel with every experiment artifact.
+    get_probs.martingale_sampling_metadata = {
+        "provider": "openai",
+        "model_identifier": model_name,
+        "tokenizer_identifier": "OpenAI server-side tokenizer (not exposed)",
+        "tokenization_verified": False,
+        "class_token_mapping": {
+            str(index): label for index, label in enumerate(label_chars)
+        },
+        "score_type": (
+            "OpenAI top_logprobs-derived class log scores; raw API logits "
+            "are not exposed"
+        ),
+        "missing_class_probability_floor": float(missing_probability),
+        "decoding_parameters": {
+            "temperature": float(temperature),
+            "logprobs": True,
+            "top_logprobs": 20,
+        },
+        "numpy_version": np.__version__,
+        "openai_version": getattr(openai, "__version__", "unknown"),
+    }
     return get_probs
 
 

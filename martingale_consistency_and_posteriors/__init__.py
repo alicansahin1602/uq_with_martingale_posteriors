@@ -10,21 +10,27 @@ from .utils import (
     save_predictions,
     setup_logger,
     run_martingale_check,
+    run_martingale_sampling_check,
+    compute_martingale_sampling_metrics,
+    save_martingale_sampling_results,
     compute_martingale_metrics,
     save_martingale_results,
     _build_hf_provider,
     _build_openai_provider,
+    _build_openai_martingale_sampling_provider,
     _build_anthropic_provider,
     _build_deepseek_provider,
     _build_ppr_hf_provider,
     _build_ppr_openai_provider,
     _build_ppr_anthropic_provider,
     _build_ppr_deepseek_provider,
+    _build_openai_martingale_sampling_provider,
     _parse_ppr_response,
     run_ppr_check,
     compute_emd_metrics,
     compute_martingale_posterior_metrics,
-    ppr_system_prompt
+    ppr_system_prompt,
+    run_martingale_sampling_check
 )
 
 __all__ = [
@@ -37,10 +43,14 @@ __all__ = [
     'save_predictions',
     'setup_logger',
     'run_martingale_check',
+    'run_martingale_sampling_check',
+    'compute_martingale_sampling_metrics',
+    'save_martingale_sampling_results',
     'compute_martingale_metrics',
     'save_martingale_results',
     '_build_hf_provider',
     '_build_openai_provider',
+    '_build_openai_martingale_sampling_provider',
     '_build_anthropic_provider',
     '_build_deepseek_provider',
     '_build_ppr_hf_provider',
@@ -51,5 +61,5 @@ __all__ = [
     'run_ppr_check',
     'compute_emd_metrics',
     'compute_martingale_posterior_metrics',
-    'ppr_system_prompt',
+    'ppr_system_prompt'
 ]
