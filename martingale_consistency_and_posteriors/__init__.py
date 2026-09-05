@@ -30,7 +30,8 @@ from .utils import (
     compute_emd_metrics,
     compute_martingale_posterior_metrics,
     ppr_system_prompt,
-    run_martingale_sampling_check
+    run_martingale_sampling_check,
+    save_martingale_sampling_results,
 )
 
 __all__ = [
@@ -61,5 +62,6 @@ __all__ = [
     'run_ppr_check',
     'compute_emd_metrics',
     'compute_martingale_posterior_metrics',
-    'ppr_system_prompt'
+    'ppr_system_prompt',
+    'save_martingale_sampling_results',
 ]
