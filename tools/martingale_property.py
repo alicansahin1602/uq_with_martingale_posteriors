@@ -61,7 +61,8 @@ from martingale_consistency_and_posteriors import (
      compute_emd_metrics,
      compute_martingale_posterior_metrics,
      _build_openai_martingale_sampling_provider,
-     run_martingale_sampling_check
+     run_martingale_sampling_check,
+     save_martingale_sampling_results,
 )
 import os
 from dotenv import load_dotenv, find_dotenv
@@ -285,8 +286,8 @@ def main():
             get_probs = _build_openai_martingale_sampling_provider(
                 model_name=api_cfg.model_name,
                 label_chars=label_chars,
-                use_logprobs=api_cfg.get("use_logprobs", False),
-                n_api_samples=n_api_samples,
+                #use_logprobs=api_cfg.get("use_logprobs", False),
+                #n_api_samples=n_api_samples,
                 api=os.getenv("OPENAI_API_KEY"),
                 raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
             )
@@ -495,18 +496,25 @@ def main():
     logger.info("=" * 60)
 
     ## Saving the results
-    out_path = save_martingale_results(
-        work_dir=work_dir,
-        seed=args.seed,
-        K=args.K,
-        distributions=result["distributions"],
-        true_labels=result["true_labels"],
-        data_indices=result["data_indices"],
-        input_texts=result["input_texts"],
-        prompt_history=result["prompt_history"],
-        metrics=metrics,
-        logger=logger
-    )
+    if args.mode != "sampling":
+        out_path = save_martingale_results(
+            work_dir=work_dir,
+            seed=args.seed,
+            K=args.K,
+            distributions=result["distributions"],
+            true_labels=result["true_labels"],
+            data_indices=result["data_indices"],
+            input_texts=result["input_texts"],
+            prompt_history=result["prompt_history"],
+            metrics=metrics,
+            logger=logger
+        )
+    else:
+        out_path = save_martingale_sampling_results(
+            work_dir=work_dir,
+            result = result,
+            logger=logger
+        )
 
     print(f"\n[martingale_property] Completed.")
     print(f"  Output              : {out_path}")

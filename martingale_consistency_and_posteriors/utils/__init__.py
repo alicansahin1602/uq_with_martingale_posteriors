@@ -25,7 +25,8 @@ from .martingale_helpers import (
     run_ppr_check,
     compute_emd_metrics,
     compute_martingale_posterior_metrics,
-    run_martingale_sampling_check
+    run_martingale_sampling_check,
+    save_martingale_sampling_results,
 )
 from .system_prompt import mcqa_system_prompt, ppr_system_prompt
 
@@ -55,5 +56,6 @@ __all__ = [
     'mcqa_system_prompt',
     'ppr_system_prompt',
     'run_martingale_sampling_check',
-    '_build_openai_martingale_sampling_provider'
+    '_build_openai_martingale_sampling_provider',
+    'save_martingale_sampling_results',
 ]
