@@ -61,6 +61,7 @@ from martingale_consistency_and_posteriors import (
      compute_emd_metrics,
      compute_martingale_posterior_metrics,
      _build_openai_martingale_sampling_provider,
+     _build_deepseek_martingale_sampling_provider,
      run_martingale_sampling_check,
      save_martingale_sampling_results,
 )
@@ -291,8 +292,17 @@ def main():
                 api=os.getenv("OPENAI_API_KEY"),
                 raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
             )
+        elif provider == "deepseek":
+            get_probs = _build_deepseek_martingale_sampling_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                #use_logprobs=api_cfg.get("use_logprobs", False),
+                #n_api_samples=n_api_samples,
+                api=os.getenv("DEEPSEEK_API_KEY"),
+                raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
+            )
         else:
-            raise ValueError(f"Sampling mode is only supported for OpenAI provider, not '{provider}'.")
+            raise ValueError(f"Sampling mode is only supported for OpenAI and DeepSeek providers, not '{provider}'.")
 
     else:
         if provider == "openai":
