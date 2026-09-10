@@ -12,6 +12,7 @@ from .model_calls import (
     _build_ppr_anthropic_provider,
     _build_ppr_deepseek_provider,
     _build_openai_martingale_sampling_provider,
+    _build_deepseek_martingale_sampling_provider,
     _parse_ppr_response,
 
 )
@@ -57,5 +58,6 @@ __all__ = [
     'ppr_system_prompt',
     'run_martingale_sampling_check',
     '_build_openai_martingale_sampling_provider',
+    "_build_deepseek_martingale_sampling_provider",
     'save_martingale_sampling_results',
 ]
