@@ -1,0 +1,4 @@
+_base_: ['../_base_/race.yaml', '../_base_/qwen_3.8_27B.yaml', '../_base_/misc.yaml']
+
+process_preds:
+    npz_file: "race.npz"
