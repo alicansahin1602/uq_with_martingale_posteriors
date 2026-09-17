@@ -6,8 +6,8 @@ measuring how much the output distribution drifts:
 
     E[p(y | y_{1:n}, Y_{n+1:n+k}) | y_{1:n}] = p(y | y_{1:n})
 
-Supports both open-source (HuggingFace) and closed-source (OpenAI, Anthropic)
-models through a unified provider interface.
+Supports Hugging Face and OpenAI-compatible API providers through a unified
+provider interface.
 
 Open-source (HuggingFace) — config unchanged from train.py
 -----------------------------------------------------------
@@ -25,12 +25,12 @@ formatting; model weights are not loaded when `api_model` is present.
     _base_: ['../_base_/arc_c.yaml', '../_base_/qwen2_7b.yaml',
              '../_base_/misc.yaml', '../_base_/non_edl_schedule.yaml']
     api_model:
-        provider: openai          # openai | anthropic
+        provider: openai          # openai | deepseek | huggingface
         model_name: gpt-4o
         use_logprobs: true        # OpenAI only; false falls back to sampling
-        n_api_samples: 30         # API calls per prompt for probability estimation (sampling mode / Anthropic)
+        n_api_samples: 30         # API calls per prompt for sampling-based estimation
 
-Set OPENAI_API_KEY or ANTHROPIC_API_KEY in the environment before running.
+Set the API key required by the configured provider before running.
 """
 
 import argparse
@@ -47,12 +47,11 @@ from martingale_consistency_and_posteriors import (
      get_model_and_tokenizer,
      setup_logger,
      _build_hf_provider,
+     _build_hf_martingale_sampling_provider,
      _build_openai_provider,
-     _build_anthropic_provider,
      _build_deepseek_provider,
      _build_ppr_hf_provider,
      _build_ppr_openai_provider,
-     _build_ppr_anthropic_provider,
      _build_ppr_deepseek_provider,
      run_martingale_check,
      compute_martingale_metrics,
@@ -218,10 +217,8 @@ def main():
 
     if args.mode == "ppr":
         # Paper's Section 4.1 protocol: theta_n is read exactly from
-        # logprobs when the provider exposes them (OpenAI, DeepSeek);
-        # Anthropic has no logprobs API so it always falls back to the
-        # cumulative empirical-frequency MLE (Eq. 6). get_probs_seed is
-        # now ALWAYS built (not gated on n_seed_answers>0): it doubles as
+        # logprobs when the provider exposes them. get_probs_seed is now
+        # ALWAYS built (not gated on n_seed_answers>0): it doubles as
         # the k=0 Direct-Query baseline that run_ppr_check needs
         # regardless of whether seeding is enabled.
         ppr_use_logprobs = api_cfg.get("use_logprobs", True)
@@ -239,19 +236,6 @@ def main():
                 use_logprobs=ppr_use_logprobs,
                 n_api_samples=n_api_samples,
                 api=os.getenv("OPENAI_API_KEY"),
-            )
-        elif provider == "anthropic":
-            get_probs = _build_ppr_anthropic_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                n_ppr_samples=n_ppr_samples,
-                api=os.getenv("ANTHROPIC_API_KEY"),
-            )
-            get_probs_seed = _build_anthropic_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                n_api_samples=n_api_samples,
-                api=os.getenv("ANTHROPIC_API_KEY"),
             )
         elif provider == "deepseek":
             raw_log_path = osp.join(work_dir, f"raw_ppr_responses_{timestamp}.jsonl")
@@ -279,7 +263,7 @@ def main():
         logger.info(
             f"PPR provider: {provider} / {api_cfg.model_name}  "
             f"n_ppr_samples={n_ppr_samples}  n_seed_answers={args.n_seed_answers}  "
-            f"use_logprobs={ppr_use_logprobs if provider != 'anthropic' else 'N/A (empirical frequency)'}"
+            f"use_logprobs={ppr_use_logprobs}"
         )
 
     elif args.mode == "sampling":
@@ -301,8 +285,18 @@ def main():
                 api=os.getenv("DEEPSEEK_API_KEY"),
                 raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
             )
+        elif provider == 'huggingface':
+            get_probs = _build_hf_martingale_sampling_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                api=os.getenv("HUGGINGFACE_API_KEY"),
+                raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
+            )
         else:
-            raise ValueError(f"Sampling mode is only supported for OpenAI and DeepSeek providers, not '{provider}'.")
+            raise ValueError(
+                "Sampling mode is only supported for OpenAI, DeepSeek, and "
+                f"Hugging Face providers, not '{provider}'."
+            )
 
     else:
         if provider == "openai":
@@ -313,13 +307,6 @@ def main():
                 n_api_samples=n_api_samples,
                 api=os.getenv("OPENAI_API_KEY"),
                 raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
-            )
-        elif provider == "anthropic":
-            get_probs = _build_anthropic_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                n_api_samples=n_api_samples,
-                api=os.getenv("ANTHROPIC_API_KEY"),
             )
         elif provider == "deepseek":
             get_probs = _build_deepseek_provider(

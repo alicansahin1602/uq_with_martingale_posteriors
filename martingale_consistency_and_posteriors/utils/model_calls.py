@@ -6,7 +6,6 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import openai
-import anthropic
 
 from typing import Callable, List, Optional, Tuple
 from openai import PermissionDeniedError
@@ -178,7 +177,7 @@ def _first_martingale_sampling_logits_and_probs(
     are available instead of silently inserting a uniform distribution.
     """
     if not content:
-        raise ValueError("OpenAI returned no logprob content for martingale_sampling.")
+        raise ValueError("Provider returned no logprob content for martingale_sampling.")
 
     label_set = set(label_chars)
     for entry in content:
@@ -199,7 +198,7 @@ def _first_martingale_sampling_logits_and_probs(
             )
 
     raise ValueError(
-        "Could not find any MCQA class token in OpenAI top_logprobs for "
+        "Could not find any MCQA class token in provider top_logprobs for "
         "martingale_sampling. Inspect the raw response log and prompt."
     )
 
@@ -342,7 +341,7 @@ def _build_hf_provider(
             if use_logprobs:
                 try:
                     resp = _retry_with_backoff(lambda: client.chat.completions.create(
-                        model=model_name,
+                        model=f'{model_name}:cheapest',
                         messages=[{
                             "role": "system",
                             "content": mcqa_system_prompt(n_classes)
@@ -504,39 +503,6 @@ def _build_openai_provider(
                     else:
                         counts += 1.0 / n_classes  # uniform fallback for off-label replies
                 probs[i] = counts / counts.sum()
-        return probs
-
-    return get_probs
-
-
-def _build_anthropic_provider(
-    model_name: str,
-    label_chars: List[str],
-    n_api_samples: int,
-    api: str = None,
-) -> Callable[[List[str]], np.ndarray]:
-    """Anthropic provider: sampling-based (no logprob API available)."""
-    client = anthropic.Anthropic(api_key=api)
-    n_classes = len(label_chars)
-
-    def get_probs(prompts: List[str]) -> np.ndarray:
-        probs = np.zeros((len(prompts), n_classes), dtype=np.float64)
-        for i, prompt in enumerate(prompts):
-            counts = np.zeros(n_classes, dtype=np.float64)
-            for _ in range(n_api_samples):
-                resp = client.messages.create(
-                    model=model_name,
-                    max_tokens=1024,
-                    thinking={"type": "enabled"},
-                    system=mcqa_system_prompt(n_classes),
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                ans = resp.content[0].text.strip().upper()
-                if ans in label_chars:
-                    counts[label_chars.index(ans)] += 1
-                else:
-                    counts += 1.0 / n_classes
-            probs[i] = counts / counts.sum()
         return probs
 
     return get_probs
@@ -850,43 +816,6 @@ def _build_ppr_openai_provider(
     return get_theta_trajectory
 
 
-def _build_ppr_anthropic_provider(
-    model_name: str,
-    label_chars: List[str],
-    n_ppr_samples: int,
-    api: str = None,
-) -> Callable[[List[str]], np.ndarray]:
-    """Anthropic PPR provider matching the paper's Section 4.1 protocol: ONE
-    continuous generation produces the whole answer sequence A_1..A_N.
-
-    Anthropic exposes no logprobs API, so theta_n is estimated as the
-    cumulative empirical frequency of the first n parsed answers -- the
-    paper's own Eq. 6 MLE estimator, evaluated at every prefix length within
-    this single generation.
-
-    Returns get_theta_trajectory(prompts) -> (batch, n_ppr_samples, C).
-    """
-    client = anthropic.Anthropic(api_key=api)
-    n_classes = len(label_chars)
-    sys_prompt = ppr_system_prompt(n_classes, N=n_ppr_samples)
-
-    def get_theta_trajectory(prompts: List[str]) -> np.ndarray:
-        trajectories = np.zeros((len(prompts), n_ppr_samples, n_classes), dtype=np.float64)
-        for i, prompt in enumerate(prompts):
-            resp = client.messages.create(
-                model=model_name,
-                max_tokens=n_ppr_samples * 4,
-                system=sys_prompt,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = resp.content[0].text if resp.content else ""
-            votes = _parse_ppr_response_votes(text, label_chars, n_ppr_samples)
-            trajectories[i] = _cumulative_theta_trajectory(votes, n_ppr_samples)
-        return trajectories
-
-    return get_theta_trajectory
-
-
 def _build_ppr_deepseek_provider(
     model_name: str,
     label_chars: List[str],
@@ -986,6 +915,122 @@ def _build_ppr_deepseek_provider(
 # ---------------------------------------------------------------------------
 # Sampling Method Builders
 # ---------------------------------------------------------------------------
+
+def _build_hf_martingale_sampling_provider(
+    model_name: str,
+    label_chars: List[str],
+    api: str = None,
+    raw_log_path: Optional[str] = None,
+    temperature: float = 0.5,
+    missing_probability: float = 1e-10,
+) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+    """Build a Hugging Face router scorer for the branching experiment.
+
+    Hugging Face exposes an OpenAI-compatible Chat Completions endpoint. The
+    returned callable requests token log probabilities and returns both their
+    per-class log scores and the corresponding normalized probabilities, with
+    shapes ``(batch, C)``. The runner samples continuations locally from those
+    probabilities, so the trajectory transition distribution is exactly the
+    returned ``p_t``.
+    """
+    if len(label_chars) > 20:
+        raise ValueError(
+            "The Hugging Face OpenAI-compatible endpoint is queried with at "
+            "most 20 top_logprobs, so no more than 20 classes are supported."
+        )
+
+    client = openai.OpenAI(
+        api_key=api,
+        base_url="https://router.huggingface.co/v1",
+    )
+    n_classes = len(label_chars)
+    routed_model_name = f"{model_name}:cheapest"
+
+    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
+        probabilities = np.zeros_like(class_scores)
+
+        for prompt_index, prompt in enumerate(prompts):
+            try:
+                response = _retry_with_backoff(
+                    lambda: client.chat.completions.create(
+                        model=routed_model_name,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": mcqa_system_prompt(n_classes),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        logprobs=True,
+                        top_logprobs=20,
+                        temperature=temperature,
+                    )
+                )
+            except PermissionDeniedError as error:
+                print("status_code:", getattr(error, "status_code", None))
+                print("message:", str(error))
+                print("body:", getattr(error, "body", None))
+                raise
+
+            choice = response.choices[0]
+            content = choice.logprobs.content if choice.logprobs else None
+            scores_i, probs_i = _first_martingale_sampling_logits_and_probs(
+                content,
+                label_chars,
+                missing_probability=missing_probability,
+            )
+            class_scores[prompt_index] = scores_i
+            probabilities[prompt_index] = probs_i
+
+            _log_raw_response(
+                raw_log_path,
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "provider": "huggingface_martingale_sampling",
+                    "model_name": model_name,
+                    "routed_model_name": routed_model_name,
+                    "prompt_index": prompt_index,
+                    "prompt": prompt,
+                    "temperature": temperature,
+                    "top_logprobs": 20,
+                    "missing_probability": missing_probability,
+                    "finish_reason": choice.finish_reason,
+                    "message_content": choice.message.content or "",
+                    "class_logprob_scores": scores_i.tolist(),
+                    "resulting_probs": probs_i.tolist(),
+                    "raw_response": response.model_dump()
+                    if hasattr(response, "model_dump")
+                    else str(response),
+                },
+            )
+
+        return class_scores, probabilities
+
+    get_probs.martingale_sampling_metadata = {
+        "provider": "huggingface",
+        "model_identifier": model_name,
+        "routed_model_identifier": routed_model_name,
+        "tokenizer_identifier": "Hugging Face server-side tokenizer (not exposed)",
+        "tokenization_verified": False,
+        "class_token_mapping": {
+            str(index): label for index, label in enumerate(label_chars)
+        },
+        "score_type": (
+            "Hugging Face router top_logprobs-derived class log scores; "
+            "raw model logits are not exposed"
+        ),
+        "missing_class_probability_floor": float(missing_probability),
+        "decoding_parameters": {
+            "temperature": float(temperature),
+            "logprobs": True,
+            "top_logprobs": 20,
+            "routing_policy": "cheapest",
+        },
+        "numpy_version": np.__version__,
+        "openai_version": getattr(openai, "__version__", "unknown"),
+    }
+    return get_probs
 
 def _build_openai_martingale_sampling_provider(
     model_name: str,
