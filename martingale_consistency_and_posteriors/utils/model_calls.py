@@ -923,6 +923,7 @@ def _build_hf_martingale_sampling_provider(
     raw_log_path: Optional[str] = None,
     temperature: float = 0.5,
     missing_probability: float = 1e-10,
+    inference_provider = 'cheapest'
 ) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
     """Build a Hugging Face router scorer for the branching experiment.
 
@@ -944,7 +945,7 @@ def _build_hf_martingale_sampling_provider(
         base_url="https://router.huggingface.co/v1",
     )
     n_classes = len(label_chars)
-    routed_model_name = f"{model_name}:cheapest"
+    routed_model_name = f"{model_name}:{inference_provider}"
 
     def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)

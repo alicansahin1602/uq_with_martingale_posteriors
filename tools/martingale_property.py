@@ -291,6 +291,7 @@ def main():
                 label_chars=label_chars,
                 api=os.getenv("HUGGINGFACE_API_KEY"),
                 raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
+                inference_provider = api_cfg.inference_provider
             )
         else:
             raise ValueError(
