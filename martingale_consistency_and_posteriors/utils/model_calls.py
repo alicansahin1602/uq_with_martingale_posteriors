@@ -1337,34 +1337,31 @@ def _build_local_hf_martingale_sampling_provider(
         prompts: List[str],
     ) -> Tuple[np.ndarray, np.ndarray]:
 
-        encoded_prompts = []
+        conversations = []
 
         for prompt in prompts:
-            messages = [
+            conversations.append([
                 {
                     "role": "system",
-                    "content": (
-                        mcqa_system_prompt(n_classes)
-                    ),
+                    "content": mcqa_system_prompt(n_classes),
                 },
                 {
                     "role": "user",
                     "content": prompt,
                 },
-            ]
+            ])
 
-            input_ids = tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-            )
-
-            encoded_prompts.append(input_ids)
-
-        batch = tokenizer.pad(
-            {"input_ids": encoded_prompts},
+        # Tokenize and pad the complete batch in one operation. In recent
+        # Transformers versions apply_chat_template returns a BatchEncoding by
+        # default; collecting those objects and passing them as `input_ids` to
+        # tokenizer.pad creates an invalid nested structure.
+        batch = tokenizer.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
             padding=True,
             return_tensors="pt",
+            return_dict=True,
         )
 
         # For a model spread over multiple GPUs, model.device normally refers
