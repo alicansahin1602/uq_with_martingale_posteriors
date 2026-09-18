@@ -1,6 +1,6 @@
 api_model:
     provider: "huggingface"
-    model_name : "Qwen/Qwen3.8-27B"
+    model_name : "Qwen/Qwen2-7B"
     use_logprobs: true
     n_api_samples: null
     inference_provider: 'deepinfra'
