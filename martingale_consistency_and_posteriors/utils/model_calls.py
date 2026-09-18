@@ -1279,7 +1279,9 @@ def _build_local_hf_martingale_sampling_provider(
     model,
     tokenizer,
     label_chars: List[str],
-    temperature: float = 0.5
+    temperature: float = 0.5,
+    raw_log_path: Optional[str] = None,
+    log_top_k: int = 20,
 ) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
     """
     Load a Hugging Face model locally and construct a provider compatible with
@@ -1295,6 +1297,8 @@ def _build_local_hf_martingale_sampling_provider(
     """
     if temperature <= 0:
         raise ValueError("temperature must be greater than zero.")
+    if log_top_k < 1:
+        raise ValueError("log_top_k must be at least one.")
 
     n_classes = len(label_chars)
 
@@ -1402,10 +1406,72 @@ def _build_local_hf_martingale_sampling_provider(
         # Normalize over the allowed MCQA classes.
         class_probs = torch.softmax(class_scores, dim=-1)
 
-        return (
-            class_scores.cpu().numpy().astype(np.float64),
-            class_probs.cpu().numpy().astype(np.float64),
+        class_scores_np = class_scores.cpu().numpy().astype(np.float64)
+        class_probs_np = class_probs.cpu().numpy().astype(np.float64)
+
+        # Do not serialize the full vocabulary distribution: for a local model
+        # that would make the JSONL log enormous. Record the top alternatives,
+        # the complete class distribution, and the exact formatted input.
+        n_top = min(log_top_k, vocabulary_log_probs.shape[-1])
+        top_logprobs, top_token_ids = torch.topk(
+            vocabulary_log_probs, k=n_top, dim=-1
         )
+        top_logprobs = top_logprobs.cpu()
+        top_token_ids = top_token_ids.cpu()
+        input_ids_cpu = batch["input_ids"].detach().cpu()
+        attention_mask_cpu = batch["attention_mask"].detach().cpu()
+
+        for prompt_index, prompt in enumerate(prompts):
+            valid_ids = input_ids_cpu[prompt_index][
+                attention_mask_cpu[prompt_index].bool()
+            ].tolist()
+            alternatives = []
+            for token_id, logprob in zip(
+                top_token_ids[prompt_index].tolist(),
+                top_logprobs[prompt_index].tolist(),
+            ):
+                alternatives.append(
+                    {
+                        "token_id": int(token_id),
+                        "token": tokenizer.convert_ids_to_tokens(int(token_id)),
+                        "decoded": tokenizer.decode([int(token_id)]),
+                        "logprob": float(logprob),
+                        "probability": float(np.exp(logprob)),
+                    }
+                )
+
+            predicted_index = int(np.argmax(class_probs_np[prompt_index]))
+            _log_raw_response(
+                raw_log_path,
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "provider": "local_transformers_martingale_sampling",
+                    "model_name": model_name,
+                    "prompt_index": prompt_index,
+                    "prompt": prompt,
+                    "formatted_prompt": tokenizer.decode(
+                        valid_ids, skip_special_tokens=False
+                    ),
+                    "input_token_count": len(valid_ids),
+                    "temperature": float(temperature),
+                    "padding_side": tokenizer.padding_side,
+                    "pad_token": tokenizer.pad_token,
+                    "pad_token_id": tokenizer.pad_token_id,
+                    "candidate_token_ids": candidate_token_ids,
+                    "top_next_token_alternatives": alternatives,
+                    "class_logprob_scores": class_scores_np[prompt_index].tolist(),
+                    "resulting_probs": class_probs_np[prompt_index].tolist(),
+                    "predicted_class_index": predicted_index,
+                    "predicted_class_label": label_chars[predicted_index],
+                    "message_content": None,
+                    "note": (
+                        "Local provider performs next-token scoring only; "
+                        "no text completion is generated."
+                    ),
+                },
+            )
+
+        return class_scores_np, class_probs_np
 
     get_probs.martingale_sampling_metadata = {
         "provider": "local_transformers",
@@ -1413,6 +1479,8 @@ def _build_local_hf_martingale_sampling_provider(
         "tokenizer_identifier": tokenizer.name_or_path,
         "class_token_mapping": candidate_token_ids,
         "temperature": temperature,
+        "raw_log_path": raw_log_path,
+        "logged_top_next_tokens": int(log_top_k),
         "score_type": "local next-token log probability",
         "tokenization_verified": True,
     }
