@@ -299,7 +299,13 @@ def main():
             else:
                 ## Locally load the model & tokenizer
                 tokenizer_run_cfg = dict(cfg.tokenizer_run_cfg)
-                model, tokenizer = get_model_and_tokenizer(**cfg.api_model) ## Default to cuda:0
+                model, tokenizer = get_model_and_tokenizer(
+                    model_name_or_path=api_cfg.model_name,
+                    model_cfg=api_cfg.model_cfg,
+                    tokenizer_cfg=api_cfg.tokenizer_cfg,
+                    special_tokens=api_cfg.special_tokens
+
+                ) ## Default to cuda:0
                 model.eval()
                 get_probs = _build_local_hf_martingale_sampling_provider(
                     model_name = api_cfg.model_name,
