@@ -311,7 +311,11 @@ def main():
                     model_name = api_cfg.model_name,
                     model = model,
                     tokenizer = tokenizer, 
-                    label_chars=label_chars
+                    label_chars=label_chars,
+                    raw_log_path=osp.join(
+                        work_dir,
+                        f"raw_direct_query_responses_{timestamp}.jsonl",
+                    ),
                 )
 
         else:
