@@ -11,6 +11,7 @@ from .model_calls import (
     _build_hf_martingale_sampling_provider,
     _build_openai_martingale_sampling_provider,
     _build_deepseek_martingale_sampling_provider,
+    _build_local_hf_martingale_sampling_provider,
     _parse_ppr_response,
 
 )
@@ -56,5 +57,6 @@ __all__ = [
     '_build_hf_martingale_sampling_provider',
     '_build_openai_martingale_sampling_provider',
     "_build_deepseek_martingale_sampling_provider",
+    "_build_local_hf_martingale_sampling_provider",
     'save_martingale_sampling_results',
 ]
