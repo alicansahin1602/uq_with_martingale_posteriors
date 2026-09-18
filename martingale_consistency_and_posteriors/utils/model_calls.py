@@ -6,7 +6,6 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import openai
-
 from typing import Callable, List, Optional, Tuple
 from openai import PermissionDeniedError
 from .system_prompt import mcqa_system_prompt, ppr_system_prompt
@@ -300,6 +299,46 @@ def _extract_ppr_trajectory_from_logprob_content(
         pad = np.repeat(traj[-1:], N - len(theta_list), axis=0)
         traj = np.concatenate([traj, pad], axis=0)
     return traj
+
+
+def extract_choice_labels(prompt: str) -> list[str]:
+    """Extract labels such as A, B, C, D from the Choices section."""
+
+    if "Choices:\n" not in prompt:
+        raise ValueError("Prompt does not contain a Choices section.")
+
+    choice_block = prompt.split("Choices:\n", 1)[1]
+
+    # Remove history and answer suffixes.
+    choice_block = choice_block.split(
+        "\nYour prior answers in previous steps", 1
+    )[0]
+    choice_block = choice_block.rsplit("\nAnswer:", 1)[0]
+
+    labels = re.findall(
+        r"(?m)^([A-Z])\)\s+",
+        choice_block,
+    )
+
+    labels = list(dict.fromkeys(labels))
+
+    if not labels:
+        raise ValueError(
+            f"Could not find answer labels in prompt:\n{prompt}"
+        )
+
+    expected_labels = [
+        chr(ord("A") + index)
+        for index in range(len(labels))
+    ]
+
+    if labels != expected_labels:
+        raise ValueError(
+            f"Expected consecutive labels {expected_labels}, "
+            f"but found {labels}."
+        )
+
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -1342,17 +1381,32 @@ def _build_local_hf_martingale_sampling_provider(
     ) -> Tuple[np.ndarray, np.ndarray]:
 
         conversations = []
-
+        valid_label_lists = []
         for prompt in prompts:
+            ## Different questions have different final labels
+            valid_labels = extract_choice_labels(prompt)
+            unknown_labels = set(valid_labels) - set(label_chars)
+            if unknown_labels:
+                raise ValueError(
+                    "Prompt contains labels not supported by the provider: "
+                    f"{sorted(unknown_labels)}"
+                )
+            valid_label_lists.append(valid_labels)
+
+
             conversations.append([
                 {
                     "role": "system",
-                    "content": mcqa_system_prompt(n_classes),
+                    "content": mcqa_system_prompt(len(valid_labels)),
                 },
                 {
                     "role": "user",
                     "content": prompt,
                 },
+                {
+                    "role": "assistant",
+                    "content": "Answer: "
+                }
             ])
 
         # Tokenize and pad the complete batch in one operation. In recent
@@ -1362,7 +1416,8 @@ def _build_local_hf_martingale_sampling_provider(
         batch = tokenizer.apply_chat_template(
             conversations,
             tokenize=True,
-            add_generation_prompt=True,
+            add_generation_prompt=False,
+            continue_final_message=True,
             padding=True,
             return_tensors="pt",
             return_dict=True,
@@ -1403,10 +1458,36 @@ def _build_local_hf_martingale_sampling_provider(
 
         class_scores = torch.stack(class_scores, dim=-1)
 
-        # Normalize over the allowed MCQA classes.
-        class_probs = torch.softmax(class_scores, dim=-1)
+        # Preserve the runner's fixed global class dimension while assigning
+        # exactly zero probability to choices that do not exist in a prompt.
+        # For example, an A-D question in an A-E run receives the mask
+        # [True, True, True, True, False].
+        valid_class_mask = torch.tensor(
+            [
+                [label in valid_labels for label in label_chars]
+                for valid_labels in valid_label_lists
+            ],
+            dtype=torch.bool,
+            device=class_scores.device,
+        )
+        if not torch.all(valid_class_mask.any(dim=-1)):
+            raise ValueError("Every prompt must contain at least one valid class.")
 
-        class_scores_np = class_scores.cpu().numpy().astype(np.float64)
+        probability_scores = class_scores.masked_fill(
+            ~valid_class_mask, -torch.inf
+        )
+        class_probs = torch.softmax(probability_scores, dim=-1)
+
+        # The shared runner rejects non-finite scores. Retain a finite score for
+        # invalid classes while their probabilities remain exactly zero.
+        invalid_log_score = float(np.log(1e-30))
+        returned_class_scores = class_scores.masked_fill(
+            ~valid_class_mask, invalid_log_score
+        )
+
+        class_scores_np = (
+            returned_class_scores.cpu().numpy().astype(np.float64)
+        )
         class_probs_np = class_probs.cpu().numpy().astype(np.float64)
 
         # Do not serialize the full vocabulary distribution: for a local model
@@ -1458,6 +1539,13 @@ def _build_local_hf_martingale_sampling_provider(
                     "pad_token": tokenizer.pad_token,
                     "pad_token_id": tokenizer.pad_token_id,
                     "candidate_token_ids": candidate_token_ids,
+                    "valid_labels": valid_label_lists[prompt_index],
+                    "valid_class_mask": (
+                        valid_class_mask[prompt_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ),
                     "top_next_token_alternatives": alternatives,
                     "class_logprob_scores": class_scores_np[prompt_index].tolist(),
                     "resulting_probs": class_probs_np[prompt_index].tolist(),
