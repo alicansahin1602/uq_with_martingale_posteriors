@@ -15,6 +15,9 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError as GoogleAPIError
 
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 
 
 # ---------------------------------------------------------------------------
@@ -1269,4 +1272,152 @@ def _build_deepseek_martingale_sampling_provider(
         "numpy_version": np.__version__,
         "openai_version": getattr(openai, "__version__", "unknown"),
     }
+    return get_probs
+
+def _build_local_hf_martingale_sampling_provider(
+    model_name, 
+    model,
+    tokenizer,
+    label_chars: List[str],
+    temperature: float = 0.5
+) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+    """
+    Load a Hugging Face model locally and construct a provider compatible with
+    run_martingale_sampling_check.
+
+    Returns
+    -------
+    get_probs(prompts)
+        A function returning:
+
+        class_log_scores: shape (batch, C)
+        class_probs:      shape (batch, C)
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be greater than zero.")
+
+    n_classes = len(label_chars)
+
+    ## Evaluation mode of the model
+    model.eval()
+    ## Adding padding size as left to the tokenizer
+    tokenizer.padding_side = 'left'
+
+    # Include common tokenizer spellings of each answer label.
+    candidate_token_ids = {}
+
+    for label in label_chars:
+        variants = {
+            label,
+            f" {label}",
+            label.lower(),
+            f" {label.lower()}",
+        }
+
+        token_ids = set()
+
+        for variant in variants:
+            ids = tokenizer.encode(
+                variant,
+                add_special_tokens=False,
+            )
+
+            if len(ids) == 1:
+                token_ids.add(ids[0])
+
+        if not token_ids:
+            raise ValueError(
+                f"Class {label!r} has no single-token representation. "
+                "Sequence-level scoring is required for this tokenizer."
+            )
+
+        candidate_token_ids[label] = sorted(token_ids)
+
+    def get_probs(
+        prompts: List[str],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+
+        encoded_prompts = []
+
+        for prompt in prompts:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        mcqa_system_prompt(n_classes)
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ]
+
+            input_ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+
+            encoded_prompts.append(input_ids)
+
+        batch = tokenizer.pad(
+            {"input_ids": encoded_prompts},
+            padding=True,
+            return_tensors="pt",
+        )
+
+        # For a model spread over multiple GPUs, model.device normally refers
+        # to the device containing the input embeddings.
+        batch = {
+            name: tensor.to(model.device)
+            for name, tensor in batch.items()
+        }
+
+        with torch.inference_mode():
+            output = model(**batch)
+
+            # Because inputs are left-padded, position -1 is the next-token
+            # prediction position for every prompt.
+            next_token_logits = output.logits[:, -1, :].float()
+
+            # Temperature-adjusted full-vocabulary log probabilities.
+            vocabulary_log_probs = torch.log_softmax(
+                next_token_logits / temperature,
+                dim=-1,
+            )
+
+        class_scores = []
+
+        for label in label_chars:
+            ids = candidate_token_ids[label]
+
+            # Sum probability mass from variants such as "A", " A", and "a".
+            label_score = torch.logsumexp(
+                vocabulary_log_probs[:, ids],
+                dim=-1,
+            )
+
+            class_scores.append(label_score)
+
+        class_scores = torch.stack(class_scores, dim=-1)
+
+        # Normalize over the allowed MCQA classes.
+        class_probs = torch.softmax(class_scores, dim=-1)
+
+        return (
+            class_scores.cpu().numpy().astype(np.float64),
+            class_probs.cpu().numpy().astype(np.float64),
+        )
+
+    get_probs.martingale_sampling_metadata = {
+        "provider": "local_transformers",
+        "model_identifier": model_name,
+        "tokenizer_identifier": tokenizer.name_or_path,
+        "class_token_mapping": candidate_token_ids,
+        "temperature": temperature,
+        "score_type": "local next-token log probability",
+        "tokenization_verified": True,
+    }
+
     return get_probs

@@ -3,4 +3,20 @@ api_model:
     model_name : "Qwen/Qwen3.8-27B"
     use_logprobs: true
     n_api_samples: null
-    inference_provider: 'ovhcloud'
+    inference_provider: 'deepinfra'
+    is_local: true
+    model_cfg:
+        type: AutoModelForCausalLM
+        torch_dtype: bfloat16
+    tokenizer_cfg:
+        type: AutoTokenizer
+        use_fast: true
+    special_tokens:
+        pad_token: "<|endoftext|>"  # Qwen2 has no dedicated pad token; reuse EOS
+
+
+tokenizer_run_cfg:
+    padding: true
+    truncation: true
+    return_tensors: "pt"
+    max_length: 300
