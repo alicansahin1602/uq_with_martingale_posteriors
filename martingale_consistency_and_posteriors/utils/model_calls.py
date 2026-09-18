@@ -341,6 +341,71 @@ def extract_choice_labels(prompt: str) -> list[str]:
     return labels
 
 
+def _prompt_label_info(
+    prompt: str,
+    label_chars: List[str],
+) -> Tuple[List[str], np.ndarray, List[int]]:
+    """Return the prompt's valid labels, global mask, and global indices."""
+
+    valid_labels = extract_choice_labels(prompt)
+    unknown_labels = [label for label in valid_labels if label not in label_chars]
+    if unknown_labels:
+        raise ValueError(
+            f"Prompt contains labels {unknown_labels} that are not in the "
+            f"configured label set {label_chars}."
+        )
+
+    valid_indices = [label_chars.index(label) for label in valid_labels]
+    valid_mask = np.zeros(len(label_chars), dtype=bool)
+    valid_mask[valid_indices] = True
+    return valid_labels, valid_mask, valid_indices
+
+
+def _embed_prompt_probabilities(
+    local_probs: np.ndarray,
+    valid_indices: List[int],
+    n_classes: int,
+) -> np.ndarray:
+    """Embed prompt-local probabilities into the configured class space."""
+
+    local_probs = np.asarray(local_probs, dtype=np.float64)
+    if local_probs.shape[-1] != len(valid_indices):
+        raise ValueError(
+            f"Expected {len(valid_indices)} local classes, got shape "
+            f"{local_probs.shape}."
+        )
+
+    global_shape = local_probs.shape[:-1] + (n_classes,)
+    global_probs = np.zeros(global_shape, dtype=np.float64)
+    global_probs[..., valid_indices] = local_probs
+    return global_probs
+
+
+def _embed_prompt_scores(
+    local_scores: np.ndarray,
+    valid_indices: List[int],
+    n_classes: int,
+    missing_probability: float,
+) -> np.ndarray:
+    """Embed scores, using a finite floor for classes absent from the prompt."""
+
+    local_scores = np.asarray(local_scores, dtype=np.float64)
+    if local_scores.shape[-1] != len(valid_indices):
+        raise ValueError(
+            f"Expected {len(valid_indices)} local classes, got shape "
+            f"{local_scores.shape}."
+        )
+
+    global_shape = local_scores.shape[:-1] + (n_classes,)
+    global_scores = np.full(
+        global_shape,
+        np.log(missing_probability),
+        dtype=np.float64,
+    )
+    global_scores[..., valid_indices] = local_scores
+    return global_scores
+
+
 # ---------------------------------------------------------------------------
 # Iterative Method Builders
 # ---------------------------------------------------------------------------
@@ -380,13 +445,16 @@ def _build_hf_provider(
     def get_probs(prompts: List[str]) -> np.ndarray:
         probs = np.zeros((len(prompts), n_classes), dtype=np.float64)
         for i, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
             if use_logprobs:
                 try:
                     resp = _retry_with_backoff(lambda: client.chat.completions.create(
                         model=f'{model_name}:cheapest',
                         messages=[{
                             "role": "system",
-                            "content": mcqa_system_prompt(n_classes)
+                            "content": mcqa_system_prompt(len(valid_labels))
                         }, {
                             "role": "user",
                             "content": prompt
@@ -404,7 +472,10 @@ def _build_hf_provider(
                     raise
 
                 content = resp.choices[0].logprobs.content if resp.choices[0].logprobs else None
-                probs[i] = _first_label_probs(content, label_chars)
+                local_probs = _first_label_probs(content, valid_labels)
+                probs[i] = _embed_prompt_probabilities(
+                    local_probs, valid_indices, n_classes
+                )
 
                 _log_raw_response(raw_log_path, {
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -413,6 +484,8 @@ def _build_hf_provider(
                     "prompt_index": i,
                     "use_logprobs": True,
                     "prompt": prompt,
+                    "valid_labels": valid_labels,
+                    "valid_class_mask": valid_mask.tolist(),
                     "finish_reason": resp.choices[0].finish_reason,
                     "reasoning_content_len": len(getattr(resp.choices[0].message, "reasoning_content", None) or ""),
                     "message_content": resp.choices[0].message.content or "",
@@ -429,7 +502,7 @@ def _build_hf_provider(
                             model=model_name,
                             messages=[{
                                 "role": "system",
-                                "content": mcqa_system_prompt(n_classes)
+                                "content": mcqa_system_prompt(len(valid_labels))
                             }, {
                                 "role": "user",
                                 "content": prompt
@@ -445,10 +518,10 @@ def _build_hf_provider(
                         raise
 
                     ans = resp.choices[0].message.content.strip().upper()
-                    if ans in label_chars:
+                    if ans in valid_labels:
                         counts[label_chars.index(ans)] += 1
                     else:
-                        counts += 1.0 / n_classes  # uniform fallback for off-label replies
+                        counts[valid_indices] += 1.0 / len(valid_labels)
                 probs[i] = counts / counts.sum()
         return probs
 
@@ -475,13 +548,16 @@ def _build_openai_provider(
     def get_probs(prompts: List[str]) -> np.ndarray:
         probs = np.zeros((len(prompts), n_classes), dtype=np.float64)
         for i, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
             if use_logprobs:
                 try:
                     resp = _retry_with_backoff(lambda: client.chat.completions.create(
                         model=model_name,
                         messages=[{
                             "role": "system",
-                            "content": mcqa_system_prompt(n_classes)
+                            "content": mcqa_system_prompt(len(valid_labels))
                         }, {
                             "role": "user",
                             "content": prompt
@@ -499,7 +575,10 @@ def _build_openai_provider(
                     raise
 
                 content = resp.choices[0].logprobs.content if resp.choices[0].logprobs else None
-                probs[i] = _first_label_probs(content, label_chars)
+                local_probs = _first_label_probs(content, valid_labels)
+                probs[i] = _embed_prompt_probabilities(
+                    local_probs, valid_indices, n_classes
+                )
 
                 _log_raw_response(raw_log_path, {
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -508,6 +587,8 @@ def _build_openai_provider(
                     "prompt_index": i,
                     "use_logprobs": True,
                     "prompt": prompt,
+                    "valid_labels": valid_labels,
+                    "valid_class_mask": valid_mask.tolist(),
                     "finish_reason": resp.choices[0].finish_reason,
                     "reasoning_content_len": len(getattr(resp.choices[0].message, "reasoning_content", None) or ""),
                     "message_content": resp.choices[0].message.content or "",
@@ -524,7 +605,7 @@ def _build_openai_provider(
                             model=model_name,
                             messages=[{
                                 "role": "system",
-                                "content": mcqa_system_prompt(n_classes)
+                                "content": mcqa_system_prompt(len(valid_labels))
                             }, {
                                 "role": "user",
                                 "content": prompt
@@ -540,10 +621,10 @@ def _build_openai_provider(
                         raise
 
                     ans = resp.choices[0].message.content.strip().upper()
-                    if ans in label_chars:
+                    if ans in valid_labels:
                         counts[label_chars.index(ans)] += 1
                     else:
-                        counts += 1.0 / n_classes  # uniform fallback for off-label replies
+                        counts[valid_indices] += 1.0 / len(valid_labels)
                 probs[i] = counts / counts.sum()
         return probs
 
@@ -577,6 +658,9 @@ def _build_deepseek_provider(
     def get_probs(prompts: List[str]) -> np.ndarray:
         probs = np.zeros((len(prompts), n_classes), dtype=np.float64)
         for i, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
             if use_logprobs:
                 try:
                     resp = _retry_with_backoff(lambda: client.chat.completions.create(
@@ -584,7 +668,7 @@ def _build_deepseek_provider(
                         messages=[
                             {
                                 "role": "system",
-                                "content": mcqa_system_prompt(n_classes)
+                                "content": mcqa_system_prompt(len(valid_labels))
                             },
                             {
                                 "role": "user",
@@ -610,7 +694,10 @@ def _build_deepseek_provider(
                     raise
 
                 content = resp.choices[0].logprobs.content if resp.choices[0].logprobs else None
-                probs[i] = _first_label_probs(content, label_chars)
+                local_probs = _first_label_probs(content, valid_labels)
+                probs[i] = _embed_prompt_probabilities(
+                    local_probs, valid_indices, n_classes
+                )
 
                 _log_raw_response(raw_log_path, {
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -619,6 +706,8 @@ def _build_deepseek_provider(
                     "prompt_index": i,
                     "use_logprobs": True,
                     "prompt": prompt,
+                    "valid_labels": valid_labels,
+                    "valid_class_mask": valid_mask.tolist(),
                     "finish_reason": resp.choices[0].finish_reason,
                     "reasoning_content_len": len(getattr(resp.choices[0].message, "reasoning_content", None) or ""),
                     "message_content": resp.choices[0].message.content or "",
@@ -635,7 +724,7 @@ def _build_deepseek_provider(
                             model=model_name,
                             messages=[{
                                 "role": "system",
-                                "content": mcqa_system_prompt(n_classes)
+                                "content": mcqa_system_prompt(len(valid_labels))
                             }, {
                                 "role": "user",
                                 "content": prompt
@@ -654,10 +743,10 @@ def _build_deepseek_provider(
                         raise
                     ans = resp.choices[0].message.content.strip().upper()
 
-                    if ans in label_chars:
+                    if ans in valid_labels:
                         counts[label_chars.index(ans)] += 1
                     else:
-                        counts += 1.0 / n_classes  # uniform fallback for off-label replies
+                        counts[valid_indices] += 1.0 / len(valid_labels)
 
                     _log_raw_response(raw_log_path, {
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -667,10 +756,12 @@ def _build_deepseek_provider(
                         "sample_index": sample_idx,
                         "use_logprobs": False,
                         "prompt": prompt,
+                        "valid_labels": valid_labels,
+                        "valid_class_mask": valid_mask.tolist(),
                         "finish_reason": resp.choices[0].finish_reason,
                         "message_content": resp.choices[0].message.content or "",
                         "parsed_answer": ans,
-                        "matched_label": ans in label_chars,
+                        "matched_label": ans in valid_labels,
                         "raw_response": resp.model_dump() if hasattr(resp, "model_dump") else str(resp),
                     })
                 probs[i] = counts / counts.sum()
@@ -704,13 +795,9 @@ def _build_ppr_hf_provider(
     prompt.
     """
     n_classes = len(label_chars)
-    sys_prompt = ppr_system_prompt(n_classes, N=n_ppr_samples)
-
-    # Per-class token-id variants (bare, space-prefixed, newline-prefixed) so we
-    # can both (a) build the flat allowed-token set for constrained decoding and
-    # (b) map a generation step's logits back to a per-class probability vector.
+    # Per-class token-id variants (bare, space-prefixed, newline-prefixed) let
+    # us build each prompt's constrained token set and recover class masses.
     label_ids_by_class: List[List[int]] = []
-    _all_label_ids: set = set()
     for c in label_chars:
         ids_for_c: set = set()
         for prefix in ("", " ", "\n"):
@@ -718,8 +805,6 @@ def _build_ppr_hf_provider(
             if ids:
                 ids_for_c.add(ids[-1])
         label_ids_by_class.append(sorted(ids_for_c))
-        _all_label_ids.update(ids_for_c)
-    label_token_ids = sorted(_all_label_ids)
 
     newline_token_ids = tokenizer.encode("\n", add_special_tokens=False)
     if not newline_token_ids:
@@ -728,8 +813,25 @@ def _build_ppr_hf_provider(
     def get_theta_trajectory(prompts: List[str]) -> np.ndarray:
         trajectories = np.zeros((len(prompts), n_ppr_samples, n_classes), dtype=np.float64)
         for i, prompt in enumerate(prompts):
+            valid_labels, _valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
+            valid_label_token_ids = sorted({
+                token_id
+                for class_index in valid_indices
+                for token_id in label_ids_by_class[class_index]
+            })
+            if not valid_label_token_ids:
+                raise ValueError(
+                    f"Tokenizer has no usable token IDs for {valid_labels}."
+                )
             messages = [
-                {"role": "system", "content": sys_prompt},
+                {
+                    "role": "system",
+                    "content": ppr_system_prompt(
+                        len(valid_labels), N=n_ppr_samples
+                    ),
+                },
                 {"role": "user", "content": prompt},
             ]
             tokenized = tokenizer.apply_chat_template(
@@ -745,7 +847,11 @@ def _build_ppr_hf_provider(
 
             def prefix_allowed_tokens_fn(_batch_id, prefix_ids):
                 gen_len = len(prefix_ids) - input_length
-                return label_token_ids if gen_len % 2 == 0 else newline_token_ids
+                return (
+                    valid_label_token_ids
+                    if gen_len % 2 == 0
+                    else newline_token_ids
+                )
 
             with torch.no_grad():
                 outputs = model.generate(
@@ -773,17 +879,25 @@ def _build_ppr_hf_provider(
                 # discarding real signal in exactly the highly-skewed distributions
                 # this whole pipeline is built to examine.
                 step_logits = outputs.scores[step_idx][0].double()  # (vocab_size,)
-                class_logits = torch.stack([
+                local_class_logits = torch.stack([
                     torch.logsumexp(step_logits[ids], dim=0)
                     if ids else torch.tensor(-1e9, dtype=torch.float64, device=step_logits.device)
-                    for ids in label_ids_by_class
+                    for ids in (
+                        label_ids_by_class[class_index]
+                        for class_index in valid_indices
+                    )
                 ])
-                trajectories[i, n_recorded] = F.softmax(class_logits, dim=-1).cpu().numpy()
+                local_probs = F.softmax(
+                    local_class_logits, dim=-1
+                ).cpu().numpy()
+                trajectories[i, n_recorded] = _embed_prompt_probabilities(
+                    local_probs, valid_indices, n_classes
+                )
                 n_recorded += 1
 
             # Defensive: pad with the last recorded theta if generation was cut short.
             if n_recorded == 0:
-                trajectories[i] = 1.0 / n_classes
+                trajectories[i][:, valid_indices] = 1.0 / len(valid_labels)
             elif n_recorded < n_ppr_samples:
                 trajectories[i, n_recorded:] = trajectories[i, n_recorded - 1]
 
@@ -816,16 +930,22 @@ def _build_ppr_openai_provider(
     """
     client = openai.OpenAI(api_key=api)
     n_classes = len(label_chars)
-    sys_prompt = ppr_system_prompt(n_classes, N=n_ppr_samples)
-
     def get_theta_trajectory(prompts: List[str]) -> np.ndarray:
         trajectories = np.zeros((len(prompts), n_ppr_samples, n_classes), dtype=np.float64)
         for i, prompt in enumerate(prompts):
+            valid_labels, _valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
             try:
                 resp = _retry_with_backoff(lambda: client.chat.completions.create(
                     model=model_name,
                     messages=[
-                        {"role": "system", "content": sys_prompt},
+                        {
+                            "role": "system",
+                            "content": ppr_system_prompt(
+                                len(valid_labels), N=n_ppr_samples
+                            ),
+                        },
                         {"role": "user", "content": prompt},
                     ],
                     max_tokens=n_ppr_samples * 4,
@@ -840,8 +960,11 @@ def _build_ppr_openai_provider(
                 raise
             content = resp.choices[0].logprobs.content if (use_logprobs and resp.choices[0].logprobs) else None
             if use_logprobs and content:
-                trajectories[i] = _extract_ppr_trajectory_from_logprob_content(
-                    content, label_chars, n_ppr_samples
+                local_trajectory = _extract_ppr_trajectory_from_logprob_content(
+                    content, valid_labels, n_ppr_samples
+                )
+                trajectories[i] = _embed_prompt_probabilities(
+                    local_trajectory, valid_indices, n_classes
                 )
             else:
                 if use_logprobs:
@@ -851,8 +974,15 @@ def _build_ppr_openai_provider(
                         "falling back to empirical-frequency theta_n for this prompt."
                     )
                 text = resp.choices[0].message.content or ""
-                votes = _parse_ppr_response_votes(text, label_chars, n_ppr_samples)
-                trajectories[i] = _cumulative_theta_trajectory(votes, n_ppr_samples)
+                votes = _parse_ppr_response_votes(
+                    text, valid_labels, n_ppr_samples
+                )
+                local_trajectory = _cumulative_theta_trajectory(
+                    votes, n_ppr_samples
+                )
+                trajectories[i] = _embed_prompt_probabilities(
+                    local_trajectory, valid_indices, n_classes
+                )
         return trajectories
 
     return get_theta_trajectory
@@ -885,16 +1015,22 @@ def _build_ppr_deepseek_provider(
     """
     client = openai.OpenAI(api_key=api, base_url="https://api.deepseek.com")
     n_classes = len(label_chars)
-    sys_prompt = ppr_system_prompt(n_classes, N=n_ppr_samples)
-
     def get_theta_trajectory(prompts: List[str]) -> np.ndarray:
         trajectories = np.zeros((len(prompts), n_ppr_samples, n_classes), dtype=np.float64)
         for i, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
             try:
                 resp = _retry_with_backoff(lambda: client.chat.completions.create(
                     model=model_name,
                     messages=[
-                        {"role": "system", "content": sys_prompt},
+                        {
+                            "role": "system",
+                            "content": ppr_system_prompt(
+                                len(valid_labels), N=n_ppr_samples
+                            ),
+                        },
                         {"role": "user", "content": prompt},
                     ],
                     # deepseek-v4-pro reasons by default unless told not to.
@@ -918,8 +1054,11 @@ def _build_ppr_deepseek_provider(
             message_content = resp.choices[0].message.content or ""
             fallback_used = not (use_logprobs and content)
             if use_logprobs and content:
-                trajectories[i] = _extract_ppr_trajectory_from_logprob_content(
-                    content, label_chars, n_ppr_samples
+                local_trajectory = _extract_ppr_trajectory_from_logprob_content(
+                    content, valid_labels, n_ppr_samples
+                )
+                trajectories[i] = _embed_prompt_probabilities(
+                    local_trajectory, valid_indices, n_classes
                 )
             else:
                 if use_logprobs:
@@ -929,8 +1068,15 @@ def _build_ppr_deepseek_provider(
                         "logprobs); falling back to empirical-frequency theta_n for "
                         "this prompt."
                     )
-                votes = _parse_ppr_response_votes(message_content, label_chars, n_ppr_samples)
-                trajectories[i] = _cumulative_theta_trajectory(votes, n_ppr_samples)
+                votes = _parse_ppr_response_votes(
+                    message_content, valid_labels, n_ppr_samples
+                )
+                local_trajectory = _cumulative_theta_trajectory(
+                    votes, n_ppr_samples
+                )
+                trajectories[i] = _embed_prompt_probabilities(
+                    local_trajectory, valid_indices, n_classes
+                )
 
             _log_raw_response(raw_log_path, {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -939,6 +1085,8 @@ def _build_ppr_deepseek_provider(
                 "prompt_index": i,
                 "use_logprobs": use_logprobs,
                 "prompt": prompt,
+                "valid_labels": valid_labels,
+                "valid_class_mask": valid_mask.tolist(),
                 "finish_reason": resp.choices[0].finish_reason,
                 "reasoning_content_len": len(getattr(resp.choices[0].message, "reasoning_content", None) or ""),
                 "message_content": message_content,
@@ -994,6 +1142,9 @@ def _build_hf_martingale_sampling_provider(
         probabilities = np.zeros_like(class_scores)
 
         for prompt_index, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
             try:
                 response = _retry_with_backoff(
                     lambda: client.chat.completions.create(
@@ -1001,7 +1152,7 @@ def _build_hf_martingale_sampling_provider(
                         messages=[
                             {
                                 "role": "system",
-                                "content": mcqa_system_prompt(n_classes),
+                                "content": mcqa_system_prompt(len(valid_labels)),
                             },
                             {"role": "user", "content": prompt},
                         ],
@@ -1018,10 +1169,16 @@ def _build_hf_martingale_sampling_provider(
 
             choice = response.choices[0]
             content = choice.logprobs.content if choice.logprobs else None
-            scores_i, probs_i = _first_martingale_sampling_logits_and_probs(
+            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
                 content,
-                label_chars,
+                valid_labels,
                 missing_probability=missing_probability,
+            )
+            scores_i = _embed_prompt_scores(
+                local_scores, valid_indices, n_classes, missing_probability
+            )
+            probs_i = _embed_prompt_probabilities(
+                local_probs, valid_indices, n_classes
             )
             class_scores[prompt_index] = scores_i
             probabilities[prompt_index] = probs_i
@@ -1035,6 +1192,8 @@ def _build_hf_martingale_sampling_provider(
                     "routed_model_name": routed_model_name,
                     "prompt_index": prompt_index,
                     "prompt": prompt,
+                    "valid_labels": valid_labels,
+                    "valid_class_mask": valid_mask.tolist(),
                     "temperature": temperature,
                     "top_logprobs": 20,
                     "missing_probability": missing_probability,
@@ -1114,6 +1273,9 @@ def _build_openai_martingale_sampling_provider(
         probabilities = np.zeros_like(class_scores)
 
         for prompt_index, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
             try:
                 response = _retry_with_backoff(
                     lambda: client.chat.completions.create(
@@ -1121,7 +1283,7 @@ def _build_openai_martingale_sampling_provider(
                         messages=[
                             {
                                 "role": "system",
-                                "content": mcqa_system_prompt(n_classes),
+                                "content": mcqa_system_prompt(len(valid_labels)),
                             },
                             {"role": "user", "content": prompt},
                         ],
@@ -1138,10 +1300,16 @@ def _build_openai_martingale_sampling_provider(
 
             choice = response.choices[0]
             content = choice.logprobs.content if choice.logprobs else None
-            scores_i, probs_i = _first_martingale_sampling_logits_and_probs(
+            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
                 content,
-                label_chars,
+                valid_labels,
                 missing_probability=missing_probability,
+            )
+            scores_i = _embed_prompt_scores(
+                local_scores, valid_indices, n_classes, missing_probability
+            )
+            probs_i = _embed_prompt_probabilities(
+                local_probs, valid_indices, n_classes
             )
             class_scores[prompt_index] = scores_i
             probabilities[prompt_index] = probs_i
@@ -1154,6 +1322,8 @@ def _build_openai_martingale_sampling_provider(
                     "model_name": model_name,
                     "prompt_index": prompt_index,
                     "prompt": prompt,
+                    "valid_labels": valid_labels,
+                    "valid_class_mask": valid_mask.tolist(),
                     "temperature": temperature,
                     "top_logprobs": 20,
                     "missing_probability": missing_probability,
@@ -1233,6 +1403,9 @@ def _build_deepseek_martingale_sampling_provider(
         probabilities = np.zeros_like(class_scores)
 
         for prompt_index, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
             try:
                 response = _retry_with_backoff(
                     lambda: client.chat.completions.create(
@@ -1240,7 +1413,7 @@ def _build_deepseek_martingale_sampling_provider(
                         messages=[
                             {
                                 "role": "system",
-                                "content": mcqa_system_prompt(n_classes),
+                                "content": mcqa_system_prompt(len(valid_labels)),
                             },
                             {"role": "user", "content": prompt},
                         ],
@@ -1257,10 +1430,16 @@ def _build_deepseek_martingale_sampling_provider(
 
             choice = response.choices[0]
             content = choice.logprobs.content if choice.logprobs else None
-            scores_i, probs_i = _first_martingale_sampling_logits_and_probs(
+            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
                 content,
-                label_chars,
+                valid_labels,
                 missing_probability=missing_probability,
+            )
+            scores_i = _embed_prompt_scores(
+                local_scores, valid_indices, n_classes, missing_probability
+            )
+            probs_i = _embed_prompt_probabilities(
+                local_probs, valid_indices, n_classes
             )
             class_scores[prompt_index] = scores_i
             probabilities[prompt_index] = probs_i
@@ -1269,10 +1448,12 @@ def _build_deepseek_martingale_sampling_provider(
                 raw_log_path,
                 {
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "provider": "openai_martingale_sampling",
+                    "provider": "deepseek_martingale_sampling",
                     "model_name": model_name,
                     "prompt_index": prompt_index,
                     "prompt": prompt,
+                    "valid_labels": valid_labels,
+                    "valid_class_mask": valid_mask.tolist(),
                     "temperature": temperature,
                     "top_logprobs": 20,
                     "missing_probability": missing_probability,
