@@ -7,6 +7,8 @@ __pycache__/
 *.so
 *.DS_Store
 *.xlsx
+*.jsonl
+*.pdf
 # Distribution / packaging
 .Python
 build/
@@ -226,3 +228,5 @@ data/results_mp*/**/raw_ppr_responses_*.jsonl
 
 # Office lock files (e.g. left behind by an open .xlsx)
 **/~$*.xlsx
+
+/data/

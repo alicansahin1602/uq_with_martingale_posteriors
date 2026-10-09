@@ -6,8 +6,8 @@ measuring how much the output distribution drifts:
 
     E[p(y | y_{1:n}, Y_{n+1:n+k}) | y_{1:n}] = p(y | y_{1:n})
 
-Supports both open-source (HuggingFace) and closed-source (OpenAI, Anthropic)
-models through a unified provider interface.
+Supports Hugging Face and OpenAI-compatible API providers through a unified
+provider interface.
 
 Open-source (HuggingFace) — config unchanged from train.py
 -----------------------------------------------------------
@@ -25,12 +25,12 @@ formatting; model weights are not loaded when `api_model` is present.
     _base_: ['../_base_/arc_c.yaml', '../_base_/qwen2_7b.yaml',
              '../_base_/misc.yaml', '../_base_/non_edl_schedule.yaml']
     api_model:
-        provider: openai          # openai | anthropic
+        provider: openai          # openai | deepseek | huggingface
         model_name: gpt-4o
         use_logprobs: true        # OpenAI only; false falls back to sampling
-        n_api_samples: 30         # API calls per prompt for probability estimation (sampling mode / Anthropic)
+        n_api_samples: 30         # API calls per prompt for sampling-based estimation
 
-Set OPENAI_API_KEY or ANTHROPIC_API_KEY in the environment before running.
+Set the API key required by the configured provider before running.
 """
 
 import argparse
@@ -47,12 +47,12 @@ from martingale_consistency_and_posteriors import (
      get_model_and_tokenizer,
      setup_logger,
      _build_hf_provider,
+     _build_hf_martingale_sampling_provider,
+     _build_local_hf_martingale_sampling_provider,
      _build_openai_provider,
-     _build_anthropic_provider,
      _build_deepseek_provider,
      _build_ppr_hf_provider,
      _build_ppr_openai_provider,
-     _build_ppr_anthropic_provider,
      _build_ppr_deepseek_provider,
      run_martingale_check,
      compute_martingale_metrics,
@@ -60,9 +60,14 @@ from martingale_consistency_and_posteriors import (
      run_ppr_check,
      compute_emd_metrics,
      compute_martingale_posterior_metrics,
+     _build_openai_martingale_sampling_provider,
+     _build_deepseek_martingale_sampling_provider,
+     run_martingale_sampling_check,
+     save_martingale_sampling_results,
 )
 import os
 from dotenv import load_dotenv, find_dotenv
+
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -99,9 +104,10 @@ def parse_args():
                    help="Override config values, e.g. model.use_peft=False.")
 
     # PPR / retrieval mode
-    p.add_argument("--mode", default="iterative", choices=["iterative", "ppr"],
+    p.add_argument("--mode", default="iterative", choices=["iterative", "ppr", "sampling"],
                    help="'iterative': one call per step (existing); "
-                        "'ppr': single call generates N i.i.d. samples (PPR); ")
+                        "'ppr': single call generates N i.i.d. samples (PPR); "
+                        "'sampling': use sampling for probability estimation.")
 
     p.add_argument("--n-ppr-samples", type=int, default=100,
                    help="Length N of the single continuous PPR generation (the paper's "
@@ -166,7 +172,7 @@ def main():
         if not cfg.get("api_model", None):
             cfg.train_cfg["per_device_eval_batch_size"] = 4
 
-    method = args.mode  # 'iterative' | 'ppr'
+    method = args.mode  # 'iterative' | 'ppr' | `sampling`
     work_dir = _build_work_dir(args.work_dir, args.config, method)
     mmengine.mkdir_or_exist(work_dir)
 
@@ -212,10 +218,8 @@ def main():
 
     if args.mode == "ppr":
         # Paper's Section 4.1 protocol: theta_n is read exactly from
-        # logprobs when the provider exposes them (OpenAI, DeepSeek);
-        # Anthropic has no logprobs API so it always falls back to the
-        # cumulative empirical-frequency MLE (Eq. 6). get_probs_seed is
-        # now ALWAYS built (not gated on n_seed_answers>0): it doubles as
+        # logprobs when the provider exposes them. get_probs_seed is now
+        # ALWAYS built (not gated on n_seed_answers>0): it doubles as
         # the k=0 Direct-Query baseline that run_ppr_check needs
         # regardless of whether seeding is enabled.
         ppr_use_logprobs = api_cfg.get("use_logprobs", True)
@@ -233,19 +237,6 @@ def main():
                 use_logprobs=ppr_use_logprobs,
                 n_api_samples=n_api_samples,
                 api=os.getenv("OPENAI_API_KEY"),
-            )
-        elif provider == "anthropic":
-            get_probs = _build_ppr_anthropic_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                n_ppr_samples=n_ppr_samples,
-                api=os.getenv("ANTHROPIC_API_KEY"),
-            )
-            get_probs_seed = _build_anthropic_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                n_api_samples=n_api_samples,
-                api=os.getenv("ANTHROPIC_API_KEY"),
             )
         elif provider == "deepseek":
             raw_log_path = osp.join(work_dir, f"raw_ppr_responses_{timestamp}.jsonl")
@@ -273,8 +264,65 @@ def main():
         logger.info(
             f"PPR provider: {provider} / {api_cfg.model_name}  "
             f"n_ppr_samples={n_ppr_samples}  n_seed_answers={args.n_seed_answers}  "
-            f"use_logprobs={ppr_use_logprobs if provider != 'anthropic' else 'N/A (empirical frequency)'}"
+            f"use_logprobs={ppr_use_logprobs}"
         )
+
+    elif args.mode == "sampling":
+        if provider == "openai":
+            get_probs = _build_openai_martingale_sampling_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                #use_logprobs=api_cfg.get("use_logprobs", False),
+                #n_api_samples=n_api_samples,
+                api=os.getenv("OPENAI_API_KEY"),
+                raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
+            )
+        elif provider == "deepseek":
+            get_probs = _build_deepseek_martingale_sampling_provider(
+                model_name=api_cfg.model_name,
+                label_chars=label_chars,
+                #use_logprobs=api_cfg.get("use_logprobs", False),
+                #n_api_samples=n_api_samples,
+                api=os.getenv("DEEPSEEK_API_KEY"),
+                raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
+            )
+        elif provider == 'huggingface':
+            if not api_cfg.is_local:
+                ## Do not load the model & tokenizer. Make an API call.
+                get_probs = _build_hf_martingale_sampling_provider(
+                    model_name=api_cfg.model_name,
+                    label_chars=label_chars,
+                    api=os.getenv("HUGGINGFACE_API_KEY"),
+                    raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
+                    inference_provider = api_cfg.inference_provider
+                )
+            else:
+                ## Locally load the model & tokenizer
+                tokenizer_run_cfg = dict(cfg.tokenizer_run_cfg)
+                model, tokenizer = get_model_and_tokenizer(
+                    model_name_or_path=api_cfg.model_name,
+                    model_cfg=api_cfg.model_cfg,
+                    tokenizer_cfg=api_cfg.tokenizer_cfg,
+                    special_tokens=api_cfg.special_tokens
+
+                ) ## Default to cuda:0
+                model.eval()
+                get_probs = _build_local_hf_martingale_sampling_provider(
+                    model_name = api_cfg.model_name,
+                    model = model,
+                    tokenizer = tokenizer, 
+                    label_chars=label_chars,
+                    raw_log_path=osp.join(
+                        work_dir,
+                        f"raw_direct_query_responses_{timestamp}.jsonl",
+                    ),
+                )
+
+        else:
+            raise ValueError(
+                "Sampling mode is only supported for OpenAI, DeepSeek, and "
+                f"Hugging Face providers, not '{provider}'."
+            )
 
     else:
         if provider == "openai":
@@ -285,13 +333,6 @@ def main():
                 n_api_samples=n_api_samples,
                 api=os.getenv("OPENAI_API_KEY"),
                 raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
-            )
-        elif provider == "anthropic":
-            get_probs = _build_anthropic_provider(
-                model_name=api_cfg.model_name,
-                label_chars=label_chars,
-                n_api_samples=n_api_samples,
-                api=os.getenv("ANTHROPIC_API_KEY"),
             )
         elif provider == "deepseek":
             get_probs = _build_deepseek_provider(
@@ -395,6 +436,20 @@ def main():
             J=args.J,
         )
 
+    elif args.mode == "sampling":
+        result = run_martingale_sampling_check(
+            get_probs=get_probs,
+            n_classes=n_classes,
+            dataset=dataset,
+            K=args.K,
+            n_samples=args.n_samples,
+            batch_size=batch_size if batch_size else 1,
+            rng=rng,
+            logger=logger,
+            label_chars=label_chars,
+            J=args.J,
+            seed =args.seed
+        )
     else:
         result = run_martingale_check(
             get_probs=get_probs,
@@ -464,18 +519,25 @@ def main():
     logger.info("=" * 60)
 
     ## Saving the results
-    out_path = save_martingale_results(
-        work_dir=work_dir,
-        seed=args.seed,
-        K=args.K,
-        distributions=result["distributions"],
-        true_labels=result["true_labels"],
-        data_indices=result["data_indices"],
-        input_texts=result["input_texts"],
-        prompt_history=result["prompt_history"],
-        metrics=metrics,
-        logger=logger
-    )
+    if args.mode != "sampling":
+        out_path = save_martingale_results(
+            work_dir=work_dir,
+            seed=args.seed,
+            K=args.K,
+            distributions=result["distributions"],
+            true_labels=result["true_labels"],
+            data_indices=result["data_indices"],
+            input_texts=result["input_texts"],
+            prompt_history=result["prompt_history"],
+            metrics=metrics,
+            logger=logger
+        )
+    else:
+        out_path = save_martingale_sampling_results(
+            work_dir=work_dir,
+            result = result,
+            logger=logger
+        )
 
     print(f"\n[martingale_property] Completed.")
     print(f"  Output              : {out_path}")
