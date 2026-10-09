@@ -3,8 +3,8 @@ import os
 import re
 import time
 import torch
+from types import SimpleNamespace
 import numpy as np
-import torch.nn.functional as F
 import openai
 from typing import Callable, List, Optional, Tuple
 from openai import PermissionDeniedError
@@ -13,10 +13,6 @@ from .system_prompt import mcqa_system_prompt
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError as GoogleAPIError
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 
 
 # ---------------------------------------------------------------------------
@@ -329,53 +325,218 @@ def _embed_prompt_scores(
 #        return F.softmax(logits.float(), dim=-1).cpu().numpy()
 #    return get_probs
 
-def _build_hf_provider(
+# Hugging Face router (API) provider -- disabled; open-source models now run locally.
+#def _build_hf_provider(
+#    model_name: str,
+#    label_chars: List[str],
+#    use_logprobs: bool,
+#    n_api_samples: int,
+#    api: str = None,
+#    raw_log_path: Optional[str] = None,
+#) -> Callable[[List[str]], np.ndarray]:
+#    """HuggingFace provider.
+#
+#    use_logprobs=True  — one API call per prompt using top_logprobs (fast, exact).
+#    use_logprobs=False — n_api_samples calls per prompt using temperature sampling.
+#    """
+#
+#    client = openai.OpenAI(api_key=api, base_url="https://router.huggingface.co/v1")
+#    n_classes = len(label_chars)
+#
+#    def get_probs(prompts: List[str]) -> np.ndarray:
+#        probs = np.zeros((len(prompts), n_classes), dtype=np.float64)
+#        for i, prompt in enumerate(prompts):
+#            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+#                prompt, label_chars
+#            )
+#            if use_logprobs:
+#                try:
+#                    resp = _retry_with_backoff(lambda: client.chat.completions.create(
+#                        model=f'{model_name}:cheapest',
+#                        messages=[{
+#                            "role": "system",
+#                            "content": mcqa_system_prompt(len(valid_labels))
+#                        }, {
+#                            "role": "user",
+#                            "content": prompt
+#                        }],
+#                        #max_tokens=1024 * 4,
+#                        #extra_body={"thinking": {"type": "enabled"}},
+#                        logprobs=True,
+#                        top_logprobs=20,
+#                        temperature=0.5
+#                    ))
+#                except PermissionDeniedError as e:
+#                    print("status_code:", getattr(e, "status_code", None))
+#                    print("message:", str(e))
+#                    print("body:", getattr(e, "body", None))
+#                    raise
+#
+#                content = resp.choices[0].logprobs.content if resp.choices[0].logprobs else None
+#                local_probs = _first_label_probs(content, valid_labels)
+#                probs[i] = _embed_prompt_probabilities(
+#                    local_probs, valid_indices, n_classes
+#                )
+#
+#                _log_raw_response(raw_log_path, {
+#                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+#                    "provider": "openai_iterative",
+#                    "model_name": model_name,
+#                    "prompt_index": i,
+#                    "use_logprobs": True,
+#                    "prompt": prompt,
+#                    "valid_labels": valid_labels,
+#                    "valid_class_mask": valid_mask.tolist(),
+#                    "finish_reason": resp.choices[0].finish_reason,
+#                    "reasoning_content_len": len(getattr(resp.choices[0].message, "reasoning_content", None) or ""),
+#                    "message_content": resp.choices[0].message.content or "",
+#                    "has_logprobs_content": content is not None,
+#                    "n_logprob_entries": len(content) if content else 0,
+#                    "resulting_probs": probs[i].tolist(),
+#                    "raw_response": resp.model_dump() if hasattr(resp, "model_dump") else str(resp),
+#                })
+#            else:
+#                counts = np.zeros(n_classes, dtype=np.float64)
+#                for _ in range(n_api_samples):
+#                    try:
+#                        resp = _retry_with_backoff(lambda: client.chat.completions.create(
+#                            model=model_name,
+#                            messages=[{
+#                                "role": "system",
+#                                "content": mcqa_system_prompt(len(valid_labels))
+#                            }, {
+#                                "role": "user",
+#                                "content": prompt
+#                            }],
+#                            max_tokens=1024,
+#                            logprobs=True,
+#                            top_logprobs=20,
+#                        ))
+#                    except PermissionDeniedError as e:
+#                        print("status_code:", getattr(e, "status_code", None))
+#                        print("message:", str(e))
+#                        print("body:", getattr(e, "body", None))
+#                        raise
+#
+#                    ans = resp.choices[0].message.content.strip().upper()
+#                    if ans in valid_labels:
+#                        counts[label_chars.index(ans)] += 1
+#                    else:
+#                        counts[valid_indices] += 1.0 / len(valid_labels)
+#                probs[i] = counts / counts.sum()
+#        return probs
+#
+#    return get_probs
+
+def _build_local_hf_provider(
     model_name: str,
+    model,
+    tokenizer,
     label_chars: List[str],
     use_logprobs: bool,
-    n_api_samples: int,
-    api: str = None,
+    n_samples: int,
+    temperature: float = 0.5,
+    max_new_tokens: int = 16,
+    top_logprobs: int = 20,
     raw_log_path: Optional[str] = None,
 ) -> Callable[[List[str]], np.ndarray]:
-    """HuggingFace provider.
+    """Local Hugging Face provider (iterative method).
 
-    use_logprobs=True  — one API call per prompt using top_logprobs (fast, exact).
-    use_logprobs=False — n_api_samples calls per prompt using temperature sampling.
+    Mirrors _build_openai_provider / _build_deepseek_provider, with the model
+    running locally instead of behind an API:
+
+    use_logprobs=True  — one generate() call per prompt batch; the top_logprobs
+        most likely tokens at every generated position play the role of the
+        API's logprobs.content, and _first_label_probs picks the first
+        position that resolves to a valid label.
+    use_logprobs=False — n_samples sampled completions per prompt; the parsed
+        answers are counted, invalid answers spread uniformly over the
+        prompt's valid labels.
+
+    Prompts are formatted with the tokenizer's chat template (system prompt +
+    user prompt + generation prompt), like the messages sent to the APIs.
     """
+    if temperature <= 0:
+        raise ValueError("temperature must be greater than zero.")
+    if tokenizer.chat_template is None:
+        raise ValueError(
+            f"Tokenizer of {model_name!r} has no chat template; the system / "
+            "user message format of the iterative providers cannot be built."
+        )
 
-    client = openai.OpenAI(api_key=api, base_url="https://router.huggingface.co/v1")
     n_classes = len(label_chars)
+    model.eval()
+    tokenizer.padding_side = "left"
+
+    def _encode(prompts: List[str], valid_label_lists: List[List[str]]) -> dict:
+        conversations = [
+            [
+                {"role": "system", "content": mcqa_system_prompt(len(valid_labels))},
+                {"role": "user", "content": prompt},
+            ]
+            for prompt, valid_labels in zip(prompts, valid_label_lists)
+        ]
+        batch = tokenizer.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            padding=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        return {name: tensor.to(model.device) for name, tensor in batch.items()}
+
+    def _parse_answer(text: str) -> str:
+        # Local (especially base) models may keep generating after the letter,
+        # so only the first whitespace-separated token is taken as the answer.
+        stripped = text.strip()
+        if not stripped:
+            return ""
+        return stripped.split(maxsplit=1)[0].strip(".,:;)").upper()
 
     def get_probs(prompts: List[str]) -> np.ndarray:
         probs = np.zeros((len(prompts), n_classes), dtype=np.float64)
-        for i, prompt in enumerate(prompts):
-            valid_labels, valid_mask, valid_indices = _prompt_label_info(
-                prompt, label_chars
-            )
-            if use_logprobs:
-                try:
-                    resp = _retry_with_backoff(lambda: client.chat.completions.create(
-                        model=f'{model_name}:cheapest',
-                        messages=[{
-                            "role": "system",
-                            "content": mcqa_system_prompt(len(valid_labels))
-                        }, {
-                            "role": "user",
-                            "content": prompt
-                        }],
-                        #max_tokens=1024 * 4,
-                        #extra_body={"thinking": {"type": "enabled"}},
-                        logprobs=True,
-                        top_logprobs=20,
-                        temperature=0.5
-                    ))
-                except PermissionDeniedError as e:
-                    print("status_code:", getattr(e, "status_code", None))
-                    print("message:", str(e))
-                    print("body:", getattr(e, "body", None))
-                    raise
+        label_info = [_prompt_label_info(prompt, label_chars) for prompt in prompts]
+        valid_label_lists = [info[0] for info in label_info]
+        batch = _encode(prompts, valid_label_lists)
+        prompt_len = batch["input_ids"].shape[1]
 
-                content = resp.choices[0].logprobs.content if resp.choices[0].logprobs else None
+        if use_logprobs:
+            with torch.inference_mode():
+                out = model.generate(
+                    **batch,
+                    do_sample=True,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    output_logits=True,
+                    return_dict_in_generate=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            generated = out.sequences[:, prompt_len:].cpu()
+            # (steps, B, V) raw logits -> temperature-scaled log probabilities
+            step_logprobs = [
+                torch.log_softmax(step.float() / temperature, dim=-1)
+                for step in out.logits
+            ]
+
+            for i, prompt in enumerate(prompts):
+                valid_labels, valid_mask, valid_indices = label_info[i]
+
+                # Rebuild an API-style logprobs.content list for this prompt.
+                content = []
+                for step, token_id in enumerate(generated[i].tolist()):
+                    if token_id == tokenizer.pad_token_id or token_id == tokenizer.eos_token_id:
+                        break
+                    top_lp, top_ids = torch.topk(step_logprobs[step][i], k=top_logprobs)
+                    content.append(SimpleNamespace(
+                        token=tokenizer.decode([token_id]),
+                        logprob=float(step_logprobs[step][i, token_id]),
+                        top_logprobs=[
+                            SimpleNamespace(token=tokenizer.decode([tid]), logprob=float(lp))
+                            for tid, lp in zip(top_ids.tolist(), top_lp.tolist())
+                        ],
+                    ))
+
                 local_probs = _first_label_probs(content, valid_labels)
                 probs[i] = _embed_prompt_probabilities(
                     local_probs, valid_indices, n_classes
@@ -383,49 +544,72 @@ def _build_hf_provider(
 
                 _log_raw_response(raw_log_path, {
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "provider": "openai_iterative",
+                    "provider": "local_hf_iterative",
                     "model_name": model_name,
                     "prompt_index": i,
                     "use_logprobs": True,
                     "prompt": prompt,
                     "valid_labels": valid_labels,
                     "valid_class_mask": valid_mask.tolist(),
-                    "finish_reason": resp.choices[0].finish_reason,
-                    "reasoning_content_len": len(getattr(resp.choices[0].message, "reasoning_content", None) or ""),
-                    "message_content": resp.choices[0].message.content or "",
-                    "has_logprobs_content": content is not None,
-                    "n_logprob_entries": len(content) if content else 0,
+                    "temperature": float(temperature),
+                    "message_content": tokenizer.decode(generated[i], skip_special_tokens=True),
+                    "has_logprobs_content": len(content) > 0,
+                    "n_logprob_entries": len(content),
+                    "logprobs_content": [
+                        {
+                            "token": entry.token,
+                            "logprob": entry.logprob,
+                            "top_logprobs": [
+                                {"token": t.token, "logprob": t.logprob}
+                                for t in entry.top_logprobs
+                            ],
+                        }
+                        for entry in content
+                    ],
                     "resulting_probs": probs[i].tolist(),
-                    "raw_response": resp.model_dump() if hasattr(resp, "model_dump") else str(resp),
                 })
-            else:
-                counts = np.zeros(n_classes, dtype=np.float64)
-                for _ in range(n_api_samples):
-                    try:
-                        resp = _retry_with_backoff(lambda: client.chat.completions.create(
-                            model=model_name,
-                            messages=[{
-                                "role": "system",
-                                "content": mcqa_system_prompt(len(valid_labels))
-                            }, {
-                                "role": "user",
-                                "content": prompt
-                            }],
-                            max_tokens=1024,
-                            logprobs=True,
-                            top_logprobs=20,
-                        ))
-                    except PermissionDeniedError as e:
-                        print("status_code:", getattr(e, "status_code", None))
-                        print("message:", str(e))
-                        print("body:", getattr(e, "body", None))
-                        raise
+        else:
+            with torch.inference_mode():
+                sequences = model.generate(
+                    **batch,
+                    do_sample=True,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    num_return_sequences=n_samples,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+            # generate() repeats each prompt n_samples times consecutively.
+            texts = tokenizer.batch_decode(
+                sequences[:, prompt_len:], skip_special_tokens=True
+            )
 
-                    ans = resp.choices[0].message.content.strip().upper()
+            for i, prompt in enumerate(prompts):
+                valid_labels, valid_mask, valid_indices = label_info[i]
+                counts = np.zeros(n_classes, dtype=np.float64)
+                for sample_idx in range(n_samples):
+                    text = texts[i * n_samples + sample_idx]
+                    ans = _parse_answer(text)
+
                     if ans in valid_labels:
                         counts[label_chars.index(ans)] += 1
                     else:
                         counts[valid_indices] += 1.0 / len(valid_labels)
+
+                    _log_raw_response(raw_log_path, {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "provider": "local_hf_direct_sampling",
+                        "model_name": model_name,
+                        "prompt_index": i,
+                        "sample_index": sample_idx,
+                        "use_logprobs": False,
+                        "prompt": prompt,
+                        "valid_labels": valid_labels,
+                        "valid_class_mask": valid_mask.tolist(),
+                        "temperature": float(temperature),
+                        "message_content": text,
+                        "parsed_answer": ans,
+                        "matched_label": ans in valid_labels,
+                    })
                 probs[i] = counts / counts.sum()
         return probs
 
@@ -674,397 +858,141 @@ def _build_deepseek_provider(
     return get_probs
 
 
+
+
+
 # ---------------------------------------------------------------------------
 # Sampling Method Builders
 # ---------------------------------------------------------------------------
 
-def _build_hf_martingale_sampling_provider(
-    model_name: str,
-    label_chars: List[str],
-    api: str = None,
-    raw_log_path: Optional[str] = None,
-    temperature: float = 0.5,
-    missing_probability: float = 1e-10,
-    inference_provider = 'cheapest'
-) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
-    """Build a Hugging Face router scorer for the branching experiment.
-
-    Hugging Face exposes an OpenAI-compatible Chat Completions endpoint. The
-    returned callable requests token log probabilities and returns both their
-    per-class log scores and the corresponding normalized probabilities, with
-    shapes ``(batch, C)``. The runner samples continuations locally from those
-    probabilities, so the trajectory transition distribution is exactly the
-    returned ``p_t``.
-    """
-    if len(label_chars) > 20:
-        raise ValueError(
-            "The Hugging Face OpenAI-compatible endpoint is queried with at "
-            "most 20 top_logprobs, so no more than 20 classes are supported."
-        )
-
-    client = openai.OpenAI(
-        api_key=api,
-        base_url="https://router.huggingface.co/v1",
-    )
-    n_classes = len(label_chars)
-    routed_model_name = f"{model_name}:{inference_provider}"
-
-    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
-        class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
-        probabilities = np.zeros_like(class_scores)
-
-        for prompt_index, prompt in enumerate(prompts):
-            valid_labels, valid_mask, valid_indices = _prompt_label_info(
-                prompt, label_chars
-            )
-            try:
-                response = _retry_with_backoff(
-                    lambda: client.chat.completions.create(
-                        model=routed_model_name,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": mcqa_system_prompt(len(valid_labels)),
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        logprobs=True,
-                        top_logprobs=20,
-                        temperature=temperature,
-                    )
-                )
-            except PermissionDeniedError as error:
-                print("status_code:", getattr(error, "status_code", None))
-                print("message:", str(error))
-                print("body:", getattr(error, "body", None))
-                raise
-
-            choice = response.choices[0]
-            content = choice.logprobs.content if choice.logprobs else None
-            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
-                content,
-                valid_labels,
-                missing_probability=missing_probability,
-            )
-            scores_i = _embed_prompt_scores(
-                local_scores, valid_indices, n_classes, missing_probability
-            )
-            probs_i = _embed_prompt_probabilities(
-                local_probs, valid_indices, n_classes
-            )
-            class_scores[prompt_index] = scores_i
-            probabilities[prompt_index] = probs_i
-
-            _log_raw_response(
-                raw_log_path,
-                {
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "provider": "huggingface_martingale_sampling",
-                    "model_name": model_name,
-                    "routed_model_name": routed_model_name,
-                    "prompt_index": prompt_index,
-                    "prompt": prompt,
-                    "valid_labels": valid_labels,
-                    "valid_class_mask": valid_mask.tolist(),
-                    "temperature": temperature,
-                    "top_logprobs": 20,
-                    "missing_probability": missing_probability,
-                    "finish_reason": choice.finish_reason,
-                    "message_content": choice.message.content or "",
-                    "class_logprob_scores": scores_i.tolist(),
-                    "resulting_probs": probs_i.tolist(),
-                    "raw_response": response.model_dump()
-                    if hasattr(response, "model_dump")
-                    else str(response),
-                },
-            )
-
-        return class_scores, probabilities
-
-    get_probs.martingale_sampling_metadata = {
-        "provider": "huggingface",
-        "model_identifier": model_name,
-        "routed_model_identifier": routed_model_name,
-        "tokenizer_identifier": "Hugging Face server-side tokenizer (not exposed)",
-        "tokenization_verified": False,
-        "class_token_mapping": {
-            str(index): label for index, label in enumerate(label_chars)
-        },
-        "score_type": (
-            "Hugging Face router top_logprobs-derived class log scores; "
-            "raw model logits are not exposed"
-        ),
-        "missing_class_probability_floor": float(missing_probability),
-        "decoding_parameters": {
-            "temperature": float(temperature),
-            "logprobs": True,
-            "top_logprobs": 20,
-            "routing_policy": "cheapest",
-        },
-        "numpy_version": np.__version__,
-        "openai_version": getattr(openai, "__version__", "unknown"),
-    }
-    return get_probs
-
-def _build_openai_martingale_sampling_provider(
-    model_name: str,
-    label_chars: List[str],
-    api: str = None,
-    raw_log_path: Optional[str] = None,
-    temperature: float = 0.5,
-    missing_probability: float = 1e-10,
-) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
-    """Build the OpenAI scorer for the exact branching experiment.
-
-    The returned ``get_probs(prompts)`` callable returns a pair:
-
-    - class_scores: ``(batch, C)`` OpenAI token log-probability scores
-    - probabilities: ``(batch, C)`` softmax-normalized class probabilities
-
-    OpenAI's API does not provide raw logits. Token log probabilities are
-    logit-equivalent up to a shared additive constant, so they preserve all
-    centered-logit comparisons requested by the experiment. Scores for labels
-    omitted by the truncated top-20 response use ``missing_probability`` as a
-    finite floor; that limitation is recorded in the callable's metadata.
-
-    Sampling the trajectory is deliberately *not* delegated to OpenAI. The
-    runner uses ``numpy.random.Generator.choice`` directly on the returned
-    five-class vector, making the actual continuation distribution q_t=p_t.
-    """
-    if len(label_chars) > 20:
-        raise ValueError(
-            "OpenAI supports at most 20 top_logprobs; this provider cannot "
-            "score more than 20 classes consistently."
-        )
-
-    client = openai.OpenAI(api_key=api)
-    n_classes = len(label_chars)
-
-    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
-        class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
-        probabilities = np.zeros_like(class_scores)
-
-        for prompt_index, prompt in enumerate(prompts):
-            valid_labels, valid_mask, valid_indices = _prompt_label_info(
-                prompt, label_chars
-            )
-            try:
-                response = _retry_with_backoff(
-                    lambda: client.chat.completions.create(
-                        model=model_name,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": mcqa_system_prompt(len(valid_labels)),
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        logprobs=True,
-                        top_logprobs=20,
-                        temperature=temperature,
-                    )
-                )
-            except PermissionDeniedError as error:
-                print("status_code:", getattr(error, "status_code", None))
-                print("message:", str(error))
-                print("body:", getattr(error, "body", None))
-                raise
-
-            choice = response.choices[0]
-            content = choice.logprobs.content if choice.logprobs else None
-            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
-                content,
-                valid_labels,
-                missing_probability=missing_probability,
-            )
-            scores_i = _embed_prompt_scores(
-                local_scores, valid_indices, n_classes, missing_probability
-            )
-            probs_i = _embed_prompt_probabilities(
-                local_probs, valid_indices, n_classes
-            )
-            class_scores[prompt_index] = scores_i
-            probabilities[prompt_index] = probs_i
-
-            _log_raw_response(
-                raw_log_path,
-                {
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "provider": "openai_martingale_sampling",
-                    "model_name": model_name,
-                    "prompt_index": prompt_index,
-                    "prompt": prompt,
-                    "valid_labels": valid_labels,
-                    "valid_class_mask": valid_mask.tolist(),
-                    "temperature": temperature,
-                    "top_logprobs": 20,
-                    "missing_probability": missing_probability,
-                    "finish_reason": choice.finish_reason,
-                    "message_content": choice.message.content or "",
-                    "class_logprob_scores": scores_i.tolist(),
-                    "resulting_probs": probs_i.tolist(),
-                    "raw_response": response.model_dump()
-                    if hasattr(response, "model_dump")
-                    else str(response),
-                },
-            )
-
-        return class_scores, probabilities
-
-    # The runner copies this into the saved result so the class-scoring and
-    # decoding choices travel with every experiment artifact.
-    get_probs.martingale_sampling_metadata = {
-        "provider": "openai",
-        "model_identifier": model_name,
-        "tokenizer_identifier": "OpenAI server-side tokenizer (not exposed)",
-        "tokenization_verified": False,
-        "class_token_mapping": {
-            str(index): label for index, label in enumerate(label_chars)
-        },
-        "score_type": (
-            "OpenAI top_logprobs-derived class log scores; raw API logits "
-            "are not exposed"
-        ),
-        "missing_class_probability_floor": float(missing_probability),
-        "decoding_parameters": {
-            "temperature": float(temperature),
-            "logprobs": True,
-            "top_logprobs": 20,
-        },
-        "numpy_version": np.__version__,
-        "openai_version": getattr(openai, "__version__", "unknown"),
-    }
-    return get_probs
-
-def _build_deepseek_martingale_sampling_provider(
-    model_name: str,
-    label_chars: List[str],
-    api: str = None,
-    raw_log_path: Optional[str] = None,
-    temperature: float = 0.5,
-    missing_probability: float = 1e-10,
-) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
-    """Build the OpenAI scorer for the exact branching experiment.
-
-    The returned ``get_probs(prompts)`` callable returns a pair:
-
-    - class_scores: ``(batch, C)`` OpenAI token log-probability scores
-    - probabilities: ``(batch, C)`` softmax-normalized class probabilities
-
-    OpenAI's API does not provide raw logits. Token log probabilities are
-    logit-equivalent up to a shared additive constant, so they preserve all
-    centered-logit comparisons requested by the experiment. Scores for labels
-    omitted by the truncated top-20 response use ``missing_probability`` as a
-    finite floor; that limitation is recorded in the callable's metadata.
-
-    Sampling the trajectory is deliberately *not* delegated to OpenAI. The
-    runner uses ``numpy.random.Generator.choice`` directly on the returned
-    five-class vector, making the actual continuation distribution q_t=p_t.
-    """
-    if len(label_chars) > 20:
-        raise ValueError(
-            "OpenAI supports at most 20 top_logprobs; this provider cannot "
-            "score more than 20 classes consistently."
-        )
-
-    client = openai.OpenAI(api_key=api, base_url="https://api.deepseek.com")
-    n_classes = len(label_chars)
-
-    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
-        class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
-        probabilities = np.zeros_like(class_scores)
-
-        for prompt_index, prompt in enumerate(prompts):
-            valid_labels, valid_mask, valid_indices = _prompt_label_info(
-                prompt, label_chars
-            )
-            try:
-                response = _retry_with_backoff(
-                    lambda: client.chat.completions.create(
-                        model=model_name,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": mcqa_system_prompt(len(valid_labels)),
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        logprobs=True,
-                        top_logprobs=20,
-                        temperature=temperature,
-                    )
-                )
-            except PermissionDeniedError as error:
-                print("status_code:", getattr(error, "status_code", None))
-                print("message:", str(error))
-                print("body:", getattr(error, "body", None))
-                raise
-
-            choice = response.choices[0]
-            content = choice.logprobs.content if choice.logprobs else None
-            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
-                content,
-                valid_labels,
-                missing_probability=missing_probability,
-            )
-            scores_i = _embed_prompt_scores(
-                local_scores, valid_indices, n_classes, missing_probability
-            )
-            probs_i = _embed_prompt_probabilities(
-                local_probs, valid_indices, n_classes
-            )
-            class_scores[prompt_index] = scores_i
-            probabilities[prompt_index] = probs_i
-
-            _log_raw_response(
-                raw_log_path,
-                {
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "provider": "deepseek_martingale_sampling",
-                    "model_name": model_name,
-                    "prompt_index": prompt_index,
-                    "prompt": prompt,
-                    "valid_labels": valid_labels,
-                    "valid_class_mask": valid_mask.tolist(),
-                    "temperature": temperature,
-                    "top_logprobs": 20,
-                    "missing_probability": missing_probability,
-                    "finish_reason": choice.finish_reason,
-                    "message_content": choice.message.content or "",
-                    "class_logprob_scores": scores_i.tolist(),
-                    "resulting_probs": probs_i.tolist(),
-                    "raw_response": response.model_dump()
-                    if hasattr(response, "model_dump")
-                    else str(response),
-                },
-            )
-
-        return class_scores, probabilities
-
-    # The runner copies this into the saved result so the class-scoring and
-    # decoding choices travel with every experiment artifact.
-    get_probs.martingale_sampling_metadata = {
-        "provider": "deepseek",
-        "model_identifier": model_name,
-        "tokenizer_identifier": "DeepSeek server-side tokenizer (not exposed)",
-        "tokenization_verified": False,
-        "class_token_mapping": {
-            str(index): label for index, label in enumerate(label_chars)
-        },
-        "score_type": (
-            "DeepSeek top_logprobs-derived class log scores; raw API logits "
-            "are not exposed"
-        ),
-        "missing_class_probability_floor": float(missing_probability),
-        "decoding_parameters": {
-            "temperature": float(temperature),
-            "logprobs": True,
-            "top_logprobs": 20,
-        },
-        "numpy_version": np.__version__,
-        "openai_version": getattr(openai, "__version__", "unknown"),
-    }
-    return get_probs
+# Hugging Face router (API) provider -- disabled; open-source models now run locally.
+#def _build_hf_martingale_sampling_provider(
+#    model_name: str,
+#    label_chars: List[str],
+#    api: str = None,
+#    raw_log_path: Optional[str] = None,
+#    temperature: float = 0.5,
+#    missing_probability: float = 1e-10,
+#    inference_provider = 'cheapest'
+#) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+#    """Build a Hugging Face router scorer for the branching experiment.
+#
+#    Hugging Face exposes an OpenAI-compatible Chat Completions endpoint. The
+#    returned callable requests token log probabilities and returns both their
+#    per-class log scores and the corresponding normalized probabilities, with
+#    shapes ``(batch, C)``. The runner samples continuations locally from those
+#    probabilities, so the trajectory transition distribution is exactly the
+#    returned ``p_t``.
+#    """
+#    if len(label_chars) > 20:
+#        raise ValueError(
+#            "The Hugging Face OpenAI-compatible endpoint is queried with at "
+#            "most 20 top_logprobs, so no more than 20 classes are supported."
+#        )
+#
+#    client = openai.OpenAI(
+#        api_key=api,
+#        base_url="https://router.huggingface.co/v1",
+#    )
+#    n_classes = len(label_chars)
+#    routed_model_name = f"{model_name}:{inference_provider}"
+#
+#    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+#        class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
+#        probabilities = np.zeros_like(class_scores)
+#
+#        for prompt_index, prompt in enumerate(prompts):
+#            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+#                prompt, label_chars
+#            )
+#            try:
+#                response = _retry_with_backoff(
+#                    lambda: client.chat.completions.create(
+#                        model=routed_model_name,
+#                        messages=[
+#                            {
+#                                "role": "system",
+#                                "content": mcqa_system_prompt(len(valid_labels)),
+#                            },
+#                            {"role": "user", "content": prompt},
+#                        ],
+#                        logprobs=True,
+#                        top_logprobs=20,
+#                        temperature=temperature,
+#                    )
+#                )
+#            except PermissionDeniedError as error:
+#                print("status_code:", getattr(error, "status_code", None))
+#                print("message:", str(error))
+#                print("body:", getattr(error, "body", None))
+#                raise
+#
+#            choice = response.choices[0]
+#            content = choice.logprobs.content if choice.logprobs else None
+#            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
+#                content,
+#                valid_labels,
+#                missing_probability=missing_probability,
+#            )
+#            scores_i = _embed_prompt_scores(
+#                local_scores, valid_indices, n_classes, missing_probability
+#            )
+#            probs_i = _embed_prompt_probabilities(
+#                local_probs, valid_indices, n_classes
+#            )
+#            class_scores[prompt_index] = scores_i
+#            probabilities[prompt_index] = probs_i
+#
+#            _log_raw_response(
+#                raw_log_path,
+#                {
+#                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+#                    "provider": "huggingface_martingale_sampling",
+#                    "model_name": model_name,
+#                    "routed_model_name": routed_model_name,
+#                    "prompt_index": prompt_index,
+#                    "prompt": prompt,
+#                    "valid_labels": valid_labels,
+#                    "valid_class_mask": valid_mask.tolist(),
+#                    "temperature": temperature,
+#                    "top_logprobs": 20,
+#                    "missing_probability": missing_probability,
+#                    "finish_reason": choice.finish_reason,
+#                    "message_content": choice.message.content or "",
+#                    "class_logprob_scores": scores_i.tolist(),
+#                    "resulting_probs": probs_i.tolist(),
+#                    "raw_response": response.model_dump()
+#                    if hasattr(response, "model_dump")
+#                    else str(response),
+#                },
+#            )
+#
+#        return class_scores, probabilities
+#
+#    get_probs.martingale_sampling_metadata = {
+#        "provider": "huggingface",
+#        "model_identifier": model_name,
+#        "routed_model_identifier": routed_model_name,
+#        "tokenizer_identifier": "Hugging Face server-side tokenizer (not exposed)",
+#        "tokenization_verified": False,
+#        "class_token_mapping": {
+#            str(index): label for index, label in enumerate(label_chars)
+#        },
+#        "score_type": (
+#            "Hugging Face router top_logprobs-derived class log scores; "
+#            "raw model logits are not exposed"
+#        ),
+#        "missing_class_probability_floor": float(missing_probability),
+#        "decoding_parameters": {
+#            "temperature": float(temperature),
+#            "logprobs": True,
+#            "top_logprobs": 20,
+#            "routing_policy": "cheapest",
+#        },
+#        "numpy_version": np.__version__,
+#        "openai_version": getattr(openai, "__version__", "unknown"),
+#    }
+#    return get_probs
 
 def _build_local_hf_martingale_sampling_provider(
     model_name, 
@@ -1327,3 +1255,265 @@ def _build_local_hf_martingale_sampling_provider(
     }
 
     return get_probs
+
+
+def _build_openai_martingale_sampling_provider(
+    model_name: str,
+    label_chars: List[str],
+    api: str = None,
+    raw_log_path: Optional[str] = None,
+    temperature: float = 0.5,
+    missing_probability: float = 1e-10,
+) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+    """Build the OpenAI scorer for the exact branching experiment.
+
+    The returned ``get_probs(prompts)`` callable returns a pair:
+
+    - class_scores: ``(batch, C)`` OpenAI token log-probability scores
+    - probabilities: ``(batch, C)`` softmax-normalized class probabilities
+
+    OpenAI's API does not provide raw logits. Token log probabilities are
+    logit-equivalent up to a shared additive constant, so they preserve all
+    centered-logit comparisons requested by the experiment. Scores for labels
+    omitted by the truncated top-20 response use ``missing_probability`` as a
+    finite floor; that limitation is recorded in the callable's metadata.
+
+    Sampling the trajectory is deliberately *not* delegated to OpenAI. The
+    runner uses ``numpy.random.Generator.choice`` directly on the returned
+    five-class vector, making the actual continuation distribution q_t=p_t.
+    """
+    if len(label_chars) > 20:
+        raise ValueError(
+            "OpenAI supports at most 20 top_logprobs; this provider cannot "
+            "score more than 20 classes consistently."
+        )
+
+    client = openai.OpenAI(api_key=api)
+    n_classes = len(label_chars)
+
+    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
+        probabilities = np.zeros_like(class_scores)
+
+        for prompt_index, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
+            try:
+                response = _retry_with_backoff(
+                    lambda: client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": mcqa_system_prompt(len(valid_labels)),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        logprobs=True,
+                        top_logprobs=20,
+                        temperature=temperature,
+                    )
+                )
+            except PermissionDeniedError as error:
+                print("status_code:", getattr(error, "status_code", None))
+                print("message:", str(error))
+                print("body:", getattr(error, "body", None))
+                raise
+
+            choice = response.choices[0]
+            content = choice.logprobs.content if choice.logprobs else None
+            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
+                content,
+                valid_labels,
+                missing_probability=missing_probability,
+            )
+            scores_i = _embed_prompt_scores(
+                local_scores, valid_indices, n_classes, missing_probability
+            )
+            probs_i = _embed_prompt_probabilities(
+                local_probs, valid_indices, n_classes
+            )
+            class_scores[prompt_index] = scores_i
+            probabilities[prompt_index] = probs_i
+
+            _log_raw_response(
+                raw_log_path,
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "provider": "openai_martingale_sampling",
+                    "model_name": model_name,
+                    "prompt_index": prompt_index,
+                    "prompt": prompt,
+                    "valid_labels": valid_labels,
+                    "valid_class_mask": valid_mask.tolist(),
+                    "temperature": temperature,
+                    "top_logprobs": 20,
+                    "missing_probability": missing_probability,
+                    "finish_reason": choice.finish_reason,
+                    "message_content": choice.message.content or "",
+                    "class_logprob_scores": scores_i.tolist(),
+                    "resulting_probs": probs_i.tolist(),
+                    "raw_response": response.model_dump()
+                    if hasattr(response, "model_dump")
+                    else str(response),
+                },
+            )
+
+        return class_scores, probabilities
+
+    # The runner copies this into the saved result so the class-scoring and
+    # decoding choices travel with every experiment artifact.
+    get_probs.martingale_sampling_metadata = {
+        "provider": "openai",
+        "model_identifier": model_name,
+        "tokenizer_identifier": "OpenAI server-side tokenizer (not exposed)",
+        "tokenization_verified": False,
+        "class_token_mapping": {
+            str(index): label for index, label in enumerate(label_chars)
+        },
+        "score_type": (
+            "OpenAI top_logprobs-derived class log scores; raw API logits "
+            "are not exposed"
+        ),
+        "missing_class_probability_floor": float(missing_probability),
+        "decoding_parameters": {
+            "temperature": float(temperature),
+            "logprobs": True,
+            "top_logprobs": 20,
+        },
+        "numpy_version": np.__version__,
+        "openai_version": getattr(openai, "__version__", "unknown"),
+    }
+    return get_probs
+
+def _build_deepseek_martingale_sampling_provider(
+    model_name: str,
+    label_chars: List[str],
+    api: str = None,
+    raw_log_path: Optional[str] = None,
+    temperature: float = 0.5,
+    missing_probability: float = 1e-10,
+) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+    """Build the OpenAI scorer for the exact branching experiment.
+
+    The returned ``get_probs(prompts)`` callable returns a pair:
+
+    - class_scores: ``(batch, C)`` OpenAI token log-probability scores
+    - probabilities: ``(batch, C)`` softmax-normalized class probabilities
+
+    OpenAI's API does not provide raw logits. Token log probabilities are
+    logit-equivalent up to a shared additive constant, so they preserve all
+    centered-logit comparisons requested by the experiment. Scores for labels
+    omitted by the truncated top-20 response use ``missing_probability`` as a
+    finite floor; that limitation is recorded in the callable's metadata.
+
+    Sampling the trajectory is deliberately *not* delegated to OpenAI. The
+    runner uses ``numpy.random.Generator.choice`` directly on the returned
+    five-class vector, making the actual continuation distribution q_t=p_t.
+    """
+    if len(label_chars) > 20:
+        raise ValueError(
+            "OpenAI supports at most 20 top_logprobs; this provider cannot "
+            "score more than 20 classes consistently."
+        )
+
+    client = openai.OpenAI(api_key=api, base_url="https://api.deepseek.com")
+    n_classes = len(label_chars)
+
+    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
+        probabilities = np.zeros_like(class_scores)
+
+        for prompt_index, prompt in enumerate(prompts):
+            valid_labels, valid_mask, valid_indices = _prompt_label_info(
+                prompt, label_chars
+            )
+            try:
+                response = _retry_with_backoff(
+                    lambda: client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": mcqa_system_prompt(len(valid_labels)),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        logprobs=True,
+                        top_logprobs=20,
+                        temperature=temperature,
+                    )
+                )
+            except PermissionDeniedError as error:
+                print("status_code:", getattr(error, "status_code", None))
+                print("message:", str(error))
+                print("body:", getattr(error, "body", None))
+                raise
+
+            choice = response.choices[0]
+            content = choice.logprobs.content if choice.logprobs else None
+            local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
+                content,
+                valid_labels,
+                missing_probability=missing_probability,
+            )
+            scores_i = _embed_prompt_scores(
+                local_scores, valid_indices, n_classes, missing_probability
+            )
+            probs_i = _embed_prompt_probabilities(
+                local_probs, valid_indices, n_classes
+            )
+            class_scores[prompt_index] = scores_i
+            probabilities[prompt_index] = probs_i
+
+            _log_raw_response(
+                raw_log_path,
+                {
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "provider": "deepseek_martingale_sampling",
+                    "model_name": model_name,
+                    "prompt_index": prompt_index,
+                    "prompt": prompt,
+                    "valid_labels": valid_labels,
+                    "valid_class_mask": valid_mask.tolist(),
+                    "temperature": temperature,
+                    "top_logprobs": 20,
+                    "missing_probability": missing_probability,
+                    "finish_reason": choice.finish_reason,
+                    "message_content": choice.message.content or "",
+                    "class_logprob_scores": scores_i.tolist(),
+                    "resulting_probs": probs_i.tolist(),
+                    "raw_response": response.model_dump()
+                    if hasattr(response, "model_dump")
+                    else str(response),
+                },
+            )
+
+        return class_scores, probabilities
+
+    # The runner copies this into the saved result so the class-scoring and
+    # decoding choices travel with every experiment artifact.
+    get_probs.martingale_sampling_metadata = {
+        "provider": "deepseek",
+        "model_identifier": model_name,
+        "tokenizer_identifier": "DeepSeek server-side tokenizer (not exposed)",
+        "tokenization_verified": False,
+        "class_token_mapping": {
+            str(index): label for index, label in enumerate(label_chars)
+        },
+        "score_type": (
+            "DeepSeek top_logprobs-derived class log scores; raw API logits "
+            "are not exposed"
+        ),
+        "missing_class_probability_floor": float(missing_probability),
+        "decoding_parameters": {
+            "temperature": float(temperature),
+            "logprobs": True,
+            "top_logprobs": 20,
+        },
+        "numpy_version": np.__version__,
+        "openai_version": getattr(openai, "__version__", "unknown"),
+    }
+    return get_probs
+
