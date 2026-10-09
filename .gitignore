@@ -29,6 +29,8 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+tmp/
+
 # PyInstaller
 #   Usually these files are written by a python script from a template
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -230,3 +232,7 @@ data/results_mp*/**/raw_ppr_responses_*.jsonl
 **/~$*.xlsx
 
 /data/
+
+# Only martingale_property.py is versioned under tools/
+tools/*
+!tools/martingale_property.py

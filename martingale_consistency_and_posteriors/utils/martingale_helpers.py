@@ -13,29 +13,6 @@ _ANSWER_SUFFIX = "\nAnswer:"
 # ---------------------------------------------------------------------------
 # Prompt manipulation helpers
 # ---------------------------------------------------------------------------
-def _strip_answer_suffix(prompt: str) -> str:
-    """Remove trailing '\\nAnswer:' from a prompt so it can be fed to a PPR provider."""
-    if prompt.endswith(_ANSWER_SUFFIX):
-        return prompt[: -len(_ANSWER_SUFFIX)]
-    return prompt
-
-def _insert_prev_answers_ppr(prompt_body: str, prev_labels: List[str], label_chars: List[str] = None, prompt_dist: List[str] = None) -> str:
-    if not prev_labels:
-        return prompt_body
-
-    if prompt_dist is not None:
-        dist_str = ", ".join(f"{label_chars[c]}={prompt_dist[c]:.0%}" for c in range(len(prompt_dist)))
-        seed_line = f"\nPreviously sampled answers: {', '.join(prev_labels)}" if prev_labels else ""
-        return (
-            f"{prompt_body}"
-            f"{seed_line}"
-            f"\nCurrent belief distribution: {dist_str}."
-            f"\nAnchor to this distribution and only update proportionally to new evidence."
-        )   
-    # fallback
-    return f"{prompt_body}\nPreviously sampled answers: {', '.join(prev_labels)}"
-
-
 def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
     """Splice the answer history into a prompt just before 'Answer:'.
 
@@ -376,8 +353,7 @@ def run_martingale_check(
 
     J independent trajectories are run per question, each starting fresh
     from the same initial prompt and independently resampling its own answer
-    history at every step (same idea as run_ppr_check's J, applied to the
-    one-call-per-step iterative provider). The J converged (k=K) distributions
+    history at every step. The J converged (k=K) distributions
     are i.i.d. samples from the martingale posterior Law(theta_K | x_Q).
 
     Returns
@@ -455,145 +431,6 @@ def run_martingale_check(
 
     return {
         "distributions": distributions,
-        "true_labels": true_labels,
-        "input_texts": input_texts,
-        "data_indices": data_indices,
-        "prompt_history": prompt_history,
-    }
-
-
-def run_ppr_check(
-    get_theta_trajectory: Callable[[List[str]], np.ndarray],
-    n_classes: int,
-    dataset,
-    n_ppr_samples: int,
-    n_samples: Optional[int],
-    rng: np.random.Generator,
-    logger,
-    label_chars: list,
-    get_probs_seed: Optional[Callable[[List[str]], np.ndarray]] = None,
-    n_seed_answers: int = 0,
-    J: int = 1,
-) -> dict:
-    """PPR check following Kim et al.'s Section 4.1 protocol exactly.
-
-    For each of J independent trajectories per question:
-      1. (optional) answer seeding: draw n_seed_answers i.i.d. samples from
-         the direct-query distribution (get_probs_seed) and prepend them
-         ONCE to the PPR prompt -- x_tilde_Q = [I; Q; S_1:m]. This is the
-         paper's Section 3/4.1 "answer seeding," not a per-step re-injected
-         belief summary.
-      2. Run ONE continuous PPR generation of n_ppr_samples answers via
-         get_theta_trajectory, which returns theta_n for n=1..n_ppr_samples
-         directly from that single generation (exact per-position logits
-         where available, else the cumulative empirical-frequency MLE --
-         see the individual provider docstrings in model_calls.py).
-
-    Unlike earlier versions of this function, there is no round-by-round loop
-    that re-prompts the model with a textual "current belief distribution"
-    summary between steps: the paper's PPR is one uninterrupted generation,
-    and theta_n is read off at every prefix length within it.
-
-    k=0 in the returned `distributions` array is a plain Direct-Query call
-    (no PPR instruction, via get_probs_seed) -- this is the paper's own
-    Direct-Query baseline (used in their Tables 1-2) and keeps this
-    function's output shape compatible with the rest of the pipeline
-    (compute_martingale_metrics etc. expect a "prior" at index 0). It is
-    computed once per question and shared across all J trajectories, same as
-    the seed distribution it doubles as.
-
-    Returns
-    -------
-    dict with keys:
-        distributions  (N, J, n_ppr_samples+1, C) -- k=0 is Direct-Query,
-                        k=1..n_ppr_samples is theta_n from the single PPR
-                        rollout of that trajectory
-        true_labels    (N,)
-        input_texts    list[str]
-        data_indices   (N,)
-        prompt_history (N, J, n_ppr_samples+1) -- k=0 is the direct-query
-                        prompt; k=1..n_ppr_samples all record the SAME single
-                        PPR prompt for that trajectory, since every theta_n
-                        in it comes from one continuous generation, not a
-                        distinct prompt per step
-    """
-    N = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
-    selected_indices = rng.choice(len(dataset), size=N, replace=False)
-
-    K = n_ppr_samples
-    distributions = np.zeros((N, J, K + 1, n_classes), dtype=np.float64)
-    true_labels = np.zeros(N, dtype=np.int32)
-    input_texts: List[str] = []
-    initial_prompts: List[str] = []
-
-    for i, dataset_idx in enumerate(selected_indices):
-        sample = dataset[int(dataset_idx)]
-        input_texts.append(sample["prompt"])
-        true_labels[i] = int(sample["label"])
-        initial_prompts.append(_strip_answer_suffix(sample["prompt"]))
-
-    try:
-        all_row_ids = dataset.get_data_indices()
-        data_indices = np.array(
-            [all_row_ids[int(idx)] for idx in selected_indices], dtype=np.int32
-        )
-    except Exception:
-        data_indices = selected_indices.astype(np.int32)
-
-    # Direct-Query baseline (k=0): one call per question, shared across all J
-    # trajectories. Doubles as the distribution answer seeds are drawn from,
-    # matching the paper's S_1:m ~ p_phi(.|Q) (Section 4.1).
-    logger.info("  Direct-Query baseline (k=0) ...")
-    if get_probs_seed is not None:
-        direct_probs = get_probs_seed(input_texts)  # (N, n_classes)
-    else:
-        direct_probs = np.full((N, n_classes), 1.0 / n_classes, dtype=np.float64)
-        logger.warning(
-            "  No get_probs_seed provided; k=0 Direct-Query baseline left "
-            "uniform. Pass a direct-query provider to populate it."
-        )
-    distributions[:, :, 0, :] = direct_probs[:, None, :]
-
-    def _make_ppr_prompt(body: str, seeds: List[str]) -> str:
-        return _insert_prev_answers_ppr(body, seeds) if seeds else body
-
-    direct_query_prompts = list(input_texts)
-    ppr_prompts_by_traj: List[List[str]] = []  # [j] -> list of N PPR prompts
-
-    for j in range(J):
-        logger.info(f"  Trajectory j={j + 1}/{J} ...")
-
-        # Answer seeding (Section 3/4.1): m i.i.d. direct-query samples,
-        # re-sampled independently per trajectory so the J rollouts stay
-        # i.i.d., prepended ONCE before the single PPR generation.
-        seeds_j: List[List[str]] = [[] for _ in range(N)]
-        if n_seed_answers > 0:
-            for i in range(N):
-                p = direct_probs[i].astype(np.float64)
-                p /= p.sum()
-                idxs = rng.choice(n_classes, size=n_seed_answers, p=p)
-                seeds_j[i] = [label_chars[idx] for idx in idxs]
-
-        ppr_prompts = [_make_ppr_prompt(initial_prompts[i], seeds_j[i]) for i in range(N)]
-        ppr_prompts_by_traj.append(ppr_prompts)
-
-        logger.info(f"    Single PPR generation (N={n_ppr_samples} answers) ...")
-        theta_traj = get_theta_trajectory(ppr_prompts)  # (N, n_ppr_samples, C)
-        distributions[:, j, 1:, :] = theta_traj
-
-    # Build (N, J, K+1) prompt history: k=0 is the direct-query prompt, and
-    # k=1..K all record the single PPR prompt for that (question, trajectory)
-    # -- there is genuinely only one prompt per trajectory, since the whole
-    # theta_1..theta_K trajectory comes from one continuous generation.
-    prompt_history = np.empty((N, J, K + 1), dtype=object)
-    for j in range(J):
-        for i in range(N):
-            prompt_history[i, j, 0] = direct_query_prompts[i]
-            for k in range(1, K + 1):
-                prompt_history[i, j, k] = ppr_prompts_by_traj[j][i]
-
-    return {
-        "distributions": distributions,   # (N, J, K+1, C)
         "true_labels": true_labels,
         "input_texts": input_texts,
         "data_indices": data_indices,
@@ -708,11 +545,11 @@ def compute_martingale_metrics(distributions: np.ndarray, true_labels: np.ndarra
 
 
 def compute_emd_metrics(distributions: np.ndarray) -> dict:
-    """Compute Expected Martingale Drift (EMD) from a PPR distribution trajectory.
+    """Compute Expected Martingale Drift (EMD) from a distribution trajectory.
 
     EMD = (1/K) * mean_{j,n} sum_{k=1}^{K} TV(p^(k,j), p^(0,j))
 
-    Accepts both (N, J, K+1, C) from run_ppr_check and the legacy (N, K+1, C)
+    Accepts both (N, J, K+1, C) from run_martingale_check and the legacy (N, K+1, C)
     shape (J=1 case); the latter is promoted to (N, 1, K+1, C) internally.
 
     Returns
@@ -742,7 +579,7 @@ def compute_martingale_posterior_metrics(distributions: np.ndarray) -> dict:
 
     Parameters
     ----------
-    distributions : (N, J, K+1, C)  — output of run_ppr_check with J > 1
+    distributions : (N, J, K+1, C)  — output of run_martingale_check with J > 1
 
     Returns
     -------
