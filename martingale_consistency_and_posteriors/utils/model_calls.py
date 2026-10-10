@@ -62,6 +62,69 @@ def _log_raw_response(log_path: Optional[str], record: dict) -> None:
         print(f"[raw_response_log] WARNING: failed to write log entry: {e}")
 
 
+def _label_log_scores_from_top_logprobs(
+    top_logprobs,
+    label_chars: List[str],
+    missing_probability: float = 1e-10,
+    missing_probability_factor: float = 10.0,
+    strip_punctuation: bool = True,
+) -> Tuple[np.ndarray, dict]:
+    """Aggregate observed label mass and impute missing labels in log space.
+
+    The configured probability is a cap, not a lower bound: the imputation
+    is also at least ``missing_probability_factor`` times smaller than the
+    least probable quantitative token in the entire returned top-k list.
+    This is an assumption about missing mass, not a recovered probability.
+    OpenAI's -9999 sentinel is unquantified and cannot define the cutoff.
+    """
+    if not 0.0 < missing_probability < 1.0:
+        raise ValueError("missing_probability must lie strictly between 0 and 1.")
+    if not np.isfinite(missing_probability_factor) or missing_probability_factor <= 1:
+        raise ValueError("missing_probability_factor must be finite and greater than 1.")
+
+    logprobs_by_label = {label: [] for label in label_chars}
+    quantitative_scores = []
+    sentinel_count = 0
+    for token_info in top_logprobs or []:
+        score = float(token_info.logprob)
+        if not np.isfinite(score):
+            raise ValueError("Provider returned non-finite token log probabilities.")
+        if score == -9999.0:
+            sentinel_count += 1
+            continue
+        quantitative_scores.append(score)
+        token = token_info.token.strip()
+        if strip_punctuation:
+            token = token.strip(".,:;)")
+        token = token.upper()
+        if token in logprobs_by_label:
+            logprobs_by_label[token].append(score)
+
+    cutoff = min(quantitative_scores) if quantitative_scores else None
+    missing_score = float(np.log(missing_probability))
+    if cutoff is not None:
+        missing_score = min(
+            missing_score, cutoff - float(np.log(missing_probability_factor))
+        )
+    class_scores = np.full(len(label_chars), missing_score, dtype=np.float64)
+    observed = np.zeros(len(label_chars), dtype=bool)
+    for class_idx, label in enumerate(label_chars):
+        values = logprobs_by_label[label]
+        if values:
+            maximum = max(values)
+            class_scores[class_idx] = maximum + np.log(
+                np.exp(np.asarray(values, dtype=np.float64) - maximum).sum()
+            )
+            observed[class_idx] = True
+
+    return class_scores, {
+        "observed_label_mask": observed.tolist(),
+        "missing_label_logprob": missing_score,
+        "top_logprob_cutoff": cutoff,
+        "unquantified_token_count": sentinel_count,
+    }
+
+
 def _label_probs_from_top_logprobs(top_logprobs, label_chars: List[str]) -> np.ndarray:
     """Turn one token position's top_logprobs list into a normalized
     per-class probability vector.
@@ -76,21 +139,10 @@ def _label_probs_from_top_logprobs(top_logprobs, label_chars: List[str]) -> np.n
     dominant entry (e.g. "A" at ~99.9999% getting overwritten by "a" at
     ~0.00006%, making some unrelated class look dominant after renormalizing).
     """
-    label_set = set(label_chars)
-    logprobs_by_label = {c: [] for c in label_chars}
-    for t in top_logprobs:
-        tok = t.token.strip().upper()
-        if tok in label_set:
-            logprobs_by_label[tok].append(t.logprob)
-    raw = np.zeros(len(label_chars), dtype=np.float64)
-    for i, c in enumerate(label_chars):
-        lps = logprobs_by_label[c]
-        if lps:
-            # Getting the sum logprob of token. You can have different tokens as output like 'A', ' A', 'a' etc. which all map to the same label 'A'. So we need to sum the probabilities of all these tokens to get the probability of label 'A'.
-            m = max(lps)
-            raw[i] = np.exp(m) * np.sum(np.exp(np.array(lps) - m))  # logsumexp, in probability space
-        else:
-            raw[i] = 1e-10
+    scores, _ = _label_log_scores_from_top_logprobs(
+        top_logprobs, label_chars, strip_punctuation=False
+    )
+    raw = np.exp(scores - scores.max())
     return raw / raw.sum()
 
 
@@ -120,6 +172,8 @@ def _martingale_sampling_label_logits_and_probs(
     top_logprobs,
     label_chars: List[str],
     missing_probability: float = 1e-10,
+    missing_probability_factor: float = 10.0,
+    diagnostics: Optional[dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Extract class scores and probabilities for martingale sampling.
 
@@ -131,29 +185,16 @@ def _martingale_sampling_label_logits_and_probs(
     Several token spellings can represent one class (``"A"``, ``" A"``,
     ``"a"``). Their masses are combined with logsumexp. A class omitted from
     the API's truncated ``top_logprobs`` list receives a documented finite
-    floor so centered-score diagnostics remain defined.
+    imputation below the returned top-k cutoff so centered-score diagnostics
+    remain defined. The configured missing probability is only a cap.
     """
-    if not 0.0 < missing_probability < 1.0:
-        raise ValueError("missing_probability must lie strictly between 0 and 1.")
-
-    label_set = set(label_chars)
-    logprobs_by_label = {label: [] for label in label_chars}
-    for token_info in top_logprobs or []:
-        token = token_info.token.strip().strip(".,:;)").upper()
-        if token in label_set:
-            logprobs_by_label[token].append(float(token_info.logprob))
-
-    class_scores = np.full(
-        len(label_chars), np.log(missing_probability), dtype=np.float64
+    class_scores, score_diagnostics = _label_log_scores_from_top_logprobs(
+        top_logprobs, label_chars, missing_probability, missing_probability_factor
     )
-    for class_idx, label in enumerate(label_chars):
-        values = logprobs_by_label[label]
-        if values:
-            # Stable logsumexp sums the probability mass of all spellings.
-            maximum = max(values)
-            class_scores[class_idx] = maximum + np.log(
-                np.exp(np.asarray(values, dtype=np.float64) - maximum).sum()
-            )
+    if not any(score_diagnostics["observed_label_mask"]):
+        raise ValueError("Provider returned no quantitative MCQA class log probabilities.")
+    if diagnostics is not None:
+        diagnostics.update(score_diagnostics)
 
     shifted = class_scores - class_scores.max()
     probabilities = np.exp(shifted)
@@ -165,6 +206,8 @@ def _first_martingale_sampling_logits_and_probs(
     content,
     label_chars: List[str],
     missing_probability: float = 1e-10,
+    missing_probability_factor: float = 10.0,
+    diagnostics: Optional[dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Use the first answer-token position carrying MCQA class scores.
 
@@ -182,7 +225,8 @@ def _first_martingale_sampling_logits_and_probs(
         emitted = entry.token.strip().strip(".,:;)").upper()
         if emitted in label_set:
             return _martingale_sampling_label_logits_and_probs(
-                entry.top_logprobs, label_chars, missing_probability
+                entry.top_logprobs, label_chars, missing_probability,
+                missing_probability_factor, diagnostics,
             )
 
     for entry in content:
@@ -192,7 +236,8 @@ def _first_martingale_sampling_logits_and_probs(
         }
         if alternatives & label_set:
             return _martingale_sampling_label_logits_and_probs(
-                entry.top_logprobs, label_chars, missing_probability
+                entry.top_logprobs, label_chars, missing_probability,
+                missing_probability_factor, diagnostics,
             )
 
     raise ValueError(
@@ -1264,6 +1309,7 @@ def _build_openai_martingale_sampling_provider(
     raw_log_path: Optional[str] = None,
     temperature: float = 0.5,
     missing_probability: float = 1e-10,
+    missing_probability_factor: float = 10.0,
 ) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
     """Build the OpenAI scorer for the exact branching experiment.
 
@@ -1275,8 +1321,8 @@ def _build_openai_martingale_sampling_provider(
     OpenAI's API does not provide raw logits. Token log probabilities are
     logit-equivalent up to a shared additive constant, so they preserve all
     centered-logit comparisons requested by the experiment. Scores for labels
-    omitted by the truncated top-20 response use ``missing_probability`` as a
-    finite floor; that limitation is recorded in the callable's metadata.
+    omitted by the truncated top-20 response use an adaptive finite imputation
+    capped by ``missing_probability``; the rule is recorded in the metadata.
 
     Sampling the trajectory is deliberately *not* delegated to OpenAI. The
     runner uses ``numpy.random.Generator.choice`` directly on the returned
@@ -1323,11 +1369,16 @@ def _build_openai_martingale_sampling_provider(
 
             choice = response.choices[0]
             content = choice.logprobs.content if choice.logprobs else None
+            score_diagnostics = {}
             local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
                 content,
                 valid_labels,
                 missing_probability=missing_probability,
+                missing_probability_factor=missing_probability_factor,
+                diagnostics=score_diagnostics,
             )
+            observed_mask = np.zeros(n_classes, dtype=bool)
+            observed_mask[valid_indices] = score_diagnostics["observed_label_mask"]
             scores_i = _embed_prompt_scores(
                 local_scores, valid_indices, n_classes, missing_probability
             )
@@ -1350,6 +1401,10 @@ def _build_openai_martingale_sampling_provider(
                     "temperature": temperature,
                     "top_logprobs": 20,
                     "missing_probability": missing_probability,
+                    "missing_probability_factor": missing_probability_factor,
+                    **score_diagnostics,
+                    "observed_label_mask": observed_mask.tolist(),
+                    "imputed_label_mask": (valid_mask & ~observed_mask).tolist(),
                     "finish_reason": choice.finish_reason,
                     "message_content": choice.message.content or "",
                     "class_logprob_scores": scores_i.tolist(),
@@ -1376,7 +1431,12 @@ def _build_openai_martingale_sampling_provider(
             "OpenAI top_logprobs-derived class log scores; raw API logits "
             "are not exposed"
         ),
+        # Retain the historical key for readers of older result artifacts.
         "missing_class_probability_floor": float(missing_probability),
+        "missing_class_probability_cap": float(missing_probability),
+        "missing_class_probability_factor": float(missing_probability_factor),
+        "missing_class_score_policy": "min(log(cap), top_k_cutoff - log(factor))",
+        "unquantified_logprob_sentinel": -9999.0,
         "decoding_parameters": {
             "temperature": float(temperature),
             "logprobs": True,
@@ -1394,8 +1454,9 @@ def _build_deepseek_martingale_sampling_provider(
     raw_log_path: Optional[str] = None,
     temperature: float = 0.5,
     missing_probability: float = 1e-10,
+    missing_probability_factor: float = 10.0,
 ) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
-    """Build the OpenAI scorer for the exact branching experiment.
+    """Build the DeepSeek scorer for the exact branching experiment.
 
     The returned ``get_probs(prompts)`` callable returns a pair:
 
@@ -1405,8 +1466,8 @@ def _build_deepseek_martingale_sampling_provider(
     OpenAI's API does not provide raw logits. Token log probabilities are
     logit-equivalent up to a shared additive constant, so they preserve all
     centered-logit comparisons requested by the experiment. Scores for labels
-    omitted by the truncated top-20 response use ``missing_probability`` as a
-    finite floor; that limitation is recorded in the callable's metadata.
+    omitted by the truncated top-20 response use an adaptive finite imputation
+    capped by ``missing_probability``; the rule is recorded in the metadata.
 
     Sampling the trajectory is deliberately *not* delegated to OpenAI. The
     runner uses ``numpy.random.Generator.choice`` directly on the returned
@@ -1453,11 +1514,16 @@ def _build_deepseek_martingale_sampling_provider(
 
             choice = response.choices[0]
             content = choice.logprobs.content if choice.logprobs else None
+            score_diagnostics = {}
             local_scores, local_probs = _first_martingale_sampling_logits_and_probs(
                 content,
                 valid_labels,
                 missing_probability=missing_probability,
+                missing_probability_factor=missing_probability_factor,
+                diagnostics=score_diagnostics,
             )
+            observed_mask = np.zeros(n_classes, dtype=bool)
+            observed_mask[valid_indices] = score_diagnostics["observed_label_mask"]
             scores_i = _embed_prompt_scores(
                 local_scores, valid_indices, n_classes, missing_probability
             )
@@ -1480,6 +1546,10 @@ def _build_deepseek_martingale_sampling_provider(
                     "temperature": temperature,
                     "top_logprobs": 20,
                     "missing_probability": missing_probability,
+                    "missing_probability_factor": missing_probability_factor,
+                    **score_diagnostics,
+                    "observed_label_mask": observed_mask.tolist(),
+                    "imputed_label_mask": (valid_mask & ~observed_mask).tolist(),
                     "finish_reason": choice.finish_reason,
                     "message_content": choice.message.content or "",
                     "class_logprob_scores": scores_i.tolist(),
@@ -1506,7 +1576,12 @@ def _build_deepseek_martingale_sampling_provider(
             "DeepSeek top_logprobs-derived class log scores; raw API logits "
             "are not exposed"
         ),
+        # Retain the historical key for readers of older result artifacts.
         "missing_class_probability_floor": float(missing_probability),
+        "missing_class_probability_cap": float(missing_probability),
+        "missing_class_probability_factor": float(missing_probability_factor),
+        "missing_class_score_policy": "min(log(cap), top_k_cutoff - log(factor))",
+        "unquantified_logprob_sentinel": -9999.0,
         "decoding_parameters": {
             "temperature": float(temperature),
             "logprobs": True,
