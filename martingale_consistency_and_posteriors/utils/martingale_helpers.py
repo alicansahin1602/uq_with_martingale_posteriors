@@ -116,12 +116,13 @@ def run_martingale_sampling_check(
 
         sum_y p_t[y] * p_{t+1}^{(y)} - p_t
 
-    exactly and samples one label from ``p_t`` to continue only that branch.
+    exactly and selects the highest-probability label in ``p_t`` to continue
+    only that branch. Ties select the first class in ``label_chars``.
     The selected branch's scores are cached and reused at the next main step,
     so a prompt is never queried twice within one trajectory.
 
     Parameters follow the notation in ``martingale_consistency_experiment.md``:
-    ``n_samples`` is Q, ``R`` is the number of independent replications, and
+    ``n_samples`` is Q, ``R`` is the number of replications, and
     ``K`` is the number of stored prediction steps (there are K-1 transitions).
 
     The returned tensors have shapes ``(Q, R, K, C)`` for ``logits``/``probs``
@@ -195,7 +196,7 @@ def run_martingale_sampling_check(
                 [int(seed), int(selected_indices[q]), j]
             ).generate_state(1, dtype=np.uint64)[0]
             trajectory_seeds[q, j] = trajectory_seed
-            trajectory_rng = np.random.default_rng(trajectory_seed)
+            # trajectory_rng = np.random.default_rng(trajectory_seed)
             history: List[str] = []
 
             current_prompt = initial_prompts[q]
@@ -238,8 +239,8 @@ def run_martingale_sampling_check(
                 branch_probs[q, j, k] = local_branch_probs
                 branch_prompt_history[q, j, k] = local_branch_prompts
 
-                # Direct categorical continuation means the weighting
-                # distribution q_t is exactly the model distribution p_t.
+                # Weight every hypothetical continuation by p_t for the local
+                # residual, independently of the argmax branch followed below.
                 local_expected_next = current_probs @ local_branch_probs
                 local_residual = local_expected_next - current_probs
                 expected_next[q, j, k] = local_expected_next
@@ -248,17 +249,18 @@ def run_martingale_sampling_check(
                 error_l2[q, j, k] = np.linalg.norm(local_residual)
                 error_max[q, j, k] = np.abs(local_residual).max()
 
-                sampled_idx = int(
-                    trajectory_rng.choice(n_classes, p=current_probs)
-                )
-                labels[q, j, k] = sampled_idx
-                history.append(label_chars[sampled_idx])
+                # sampled_idx = int(
+                #     trajectory_rng.choice(n_classes, p=current_probs)
+                # )
+                selected_idx = int(np.argmax(current_probs))
+                labels[q, j, k] = selected_idx
+                history.append(label_chars[selected_idx])
 
-                # Continue only the sampled branch and reuse its already
+                # Continue only the argmax branch and reuse its already
                 # evaluated distribution/logit-equivalent scores.
-                current_prompt = local_branch_prompts[sampled_idx]
-                current_logits = local_branch_logits[sampled_idx]
-                current_probs = local_branch_probs[sampled_idx]
+                current_prompt = local_branch_prompts[selected_idx]
+                current_logits = local_branch_logits[selected_idx]
+                current_probs = local_branch_probs[selected_idx]
 
     centered_logits = logits - logits.mean(axis=-1, keepdims=True)
     safe_probs = np.clip(probs, 1e-300, 1.0)
@@ -290,7 +292,7 @@ def run_martingale_sampling_check(
             "C": int(n_classes),
             "label_chars": list(label_chars),
             "prompt_history_template": "<initial prompt body>\\nYour previous answers: <comma-separated labels>\\nAnswer:",
-            "sampling_rule": "numpy.random.Generator.choice(C, p=p_t)",
+            "sampling_rule": "numpy.argmax(p_t)",
             "dtype": str(probs.dtype),
         }
     )

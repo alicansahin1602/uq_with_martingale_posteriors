@@ -1,0 +1,12 @@
+# GPQA's upstream CSV is exposed as a "train" split. Here it is used only
+# for evaluation via the runner's default --split test. Do not alias the same
+# questions into train/val/test or concatenate them with --split all.
+data:
+    test:
+        type: GPQADataset
+        dataset_cfg:
+            name: gpqa_main
+            split: train
+        add_space: True
+        subset_size: null
+        shuffle_seed: 42
