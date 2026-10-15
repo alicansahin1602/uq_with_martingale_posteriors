@@ -15,9 +15,9 @@
     "answer_key": "A"
   },
   {
-    "question": "Which letter comes immediately after A in the English alphabet?",
-    "choices": ["C", "D", "B", "E"],
-    "answer_key": "C"
+    "question": "How many minutes are in an hour?",
+    "choices": ["50", "60", "70", "80"],
+    "answer_key": "B"
   },
   {
     "question": "Which animal typically makes the sound 'meow'?",
