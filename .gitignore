@@ -236,3 +236,7 @@ data/results_mp*/**/raw_ppr_responses_*.jsonl
 # Only martingale_property.py is versioned under tools/
 tools/*
 !tools/martingale_property.py
+
+# Local tests and generated output
+/tests/
+/output/
