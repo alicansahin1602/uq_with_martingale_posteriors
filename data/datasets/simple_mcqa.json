@@ -1,0 +1,27 @@
+[
+  {
+    "question": "What is 2 + 2?",
+    "choices": ["3", "4", "5", "6"],
+    "answer_key": "B"
+  },
+  {
+    "question": "How many days are in one week?",
+    "choices": ["5", "6", "8", "7"],
+    "answer_key": "D"
+  },
+  {
+    "question": "How many sides does a triangle have?",
+    "choices": ["3", "2", "4", "5"],
+    "answer_key": "A"
+  },
+  {
+    "question": "Which letter comes immediately after A in the English alphabet?",
+    "choices": ["C", "D", "B", "E"],
+    "answer_key": "C"
+  },
+  {
+    "question": "Which animal typically makes the sound 'meow'?",
+    "choices": ["Cow", "Cat", "Dog", "Horse"],
+    "answer_key": "B"
+  }
+]

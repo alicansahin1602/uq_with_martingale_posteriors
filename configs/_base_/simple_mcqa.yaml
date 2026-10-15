@@ -1,0 +1,8 @@
+# Evaluation-only control set. Do not use --split all.
+data:
+    test:
+        type: LocalMCQADataset
+        data_file: data/datasets/simple_mcqa.json
+        n_labels: 4
+        add_space: True
+        subset_size: null
