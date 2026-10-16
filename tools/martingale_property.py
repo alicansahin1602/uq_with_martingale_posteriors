@@ -35,6 +35,7 @@ Set the API key required by the configured provider before running.
 
 import argparse
 import os.path as osp
+import uuid
 from datetime import datetime
 
 import mmengine
@@ -62,6 +63,7 @@ from martingale_consistency_and_posteriors import (
 )
 import os
 from dotenv import load_dotenv, find_dotenv
+from martingale_consistency_and_posteriors.utils.prompt_strategies import build_prompt_strategy
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +76,9 @@ def parse_args():
     )
     p.add_argument("--config", required=True,
                    help="Config file for the model to evaluate.")
+    p.add_argument('--prompt-config', help='Optional YAML with a prompt_cfg block (sampling only).')
+    p.add_argument('--overwrite', action='store_true',
+                   help='Allow replacing existing results in the legacy output directory.')
     p.add_argument("--work-dir", "-w", required=True,
                    help="Root directory for outputs.")
     p.add_argument("--seed", type=int, default=42)
@@ -120,11 +125,16 @@ def parse_args():
 # Output path
 # ---------------------------------------------------------------------------
 
-def _build_work_dir(root: str, cfg_path: str, method: str) -> str:
+def _build_work_dir(root: str, cfg_path: str, method: str, prompt_strategy=None, run_id=None) -> str:
+    """Keep legacy paths; isolate new prompt configurations and repeated runs."""
     # 'configs/arc_c_qwen2_7b/lora_arc_c_qwen2_7b.yaml'
     # -> '<root>/arc_c_qwen2_7b/martingale_check'
     folder = osp.basename(osp.dirname(cfg_path))
-    return osp.join(root, folder, "martingale_check", method)
+    base = osp.join(root, folder, "martingale_check", method)
+    if prompt_strategy is None or prompt_strategy.is_legacy:
+        return base
+    strategy_id = f"{prompt_strategy.config['history_format']}_{prompt_strategy.fingerprint}"
+    return osp.join(base, strategy_id, run_id or uuid.uuid4().hex)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -141,8 +151,18 @@ def main():
 
     # Load and optionally patch config
     cfg = mmengine.Config.fromfile(args.config)
+    if args.prompt_config:
+        prompt_file = mmengine.Config.fromfile(args.prompt_config)
+        if set(prompt_file) != {'prompt_cfg'}:
+            raise ValueError('--prompt-config must contain only a prompt_cfg block.')
+        cfg.prompt_cfg = prompt_file.prompt_cfg
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
+    # Reject unsupported settings before dataset downloads, keys, or model loading.
+    prompt_strategy = build_prompt_strategy(cfg.get('prompt_cfg'))
+    if args.mode != 'sampling' and not prompt_strategy.is_legacy:
+        raise ValueError('New prompt strategies require --mode sampling; iterative is unchanged.')
+    cfg.prompt_cfg = prompt_strategy.config
 
     if args.test_run:
         args.K = 3
@@ -154,7 +174,11 @@ def main():
             cfg.train_cfg["per_device_eval_batch_size"] = 4
 
     method = args.mode  # 'iterative' | 'sampling'
-    work_dir = _build_work_dir(args.work_dir, args.config, method)
+    work_dir = _build_work_dir(args.work_dir, args.config, method, prompt_strategy)
+    # Iterative results append separate seed entries; leave that existing behavior alone.
+    result_path = osp.join(work_dir, 'martingale_sampling_results.npz')
+    if method == 'sampling' and osp.exists(result_path) and not args.overwrite:
+        raise FileExistsError('Results already exist. Choose another --work-dir or pass --overwrite.')
     mmengine.mkdir_or_exist(work_dir)
 
     logger = setup_logger(
@@ -330,7 +354,8 @@ def main():
             logger=logger,
             label_chars=label_chars,
             J=args.J,
-            seed =args.seed
+            seed=args.seed,
+            prompt_strategy=prompt_strategy,
         )
     else:
         result = run_martingale_check(

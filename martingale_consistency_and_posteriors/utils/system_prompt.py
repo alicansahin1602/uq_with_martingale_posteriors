@@ -75,3 +75,45 @@ SUMMARY
 - Output exactly one letter and nothing else.\
 """
     return prompt
+
+
+def build_configurable_system_prompt(valid_labels, history_format, treatment, extra_paragraphs=()):
+    """Explain only the selected history fields; keep the single-letter contract.
+
+    Extra paragraphs are literal text placed before the final output rule.
+    This builder does not change the legacy ``mcqa_system_prompt`` above.
+    """
+    labels = ', '.join(valid_labels)
+    definitions = ['History records earlier sampling steps for this same question.']
+    if history_format in ('labels', 'labels_counts_mean_probs'):
+        definitions.append('Ordered sampled labels lists the earlier draws in chronological order.')
+    if history_format != 'labels':
+        definitions.append('Times sampled counts how often each label was drawn.')
+    if 'mean_probs' in history_format:
+        definitions.append(
+            'Mean previous probability is the arithmetic mean of that label\'s normalized '
+            'answer probability over ALL preceding sampling steps, including steps when '
+            'that label was not drawn. Displayed values are rounded.'
+        )
+    definitions.append('No correctness feedback was provided.')
+    sections = [
+        'You are a multiple-choice question answering assistant. Select the single best '
+        'answer from the provided options.',
+        f'VALID ANSWER LABELS\n{labels}',
+        'PREVIOUS ANSWERS\n' + '\n'.join(definitions),
+    ]
+    if treatment == 'sampling_aware':
+        sections.append(
+            'Earlier labels were sampled from your previous answer distributions. They '
+            'are not verified answers or independent evidence about which option is correct. '
+            'Sampling counts can differ from the probabilities that generated them.\n'
+            'Do not interpret a frequently sampled label as established correct, or an '
+            'infrequently sampled label as ruled out. When alternatives remain plausible, '
+            'repetition alone does not resolve that uncertainty.'
+        )
+    sections.extend(extra_paragraphs)
+    sections.append(
+        f'RESPONSE FORMAT\nRespond with ONLY one uppercase answer label from: {labels}. '
+        'Do not include explanations, punctuation, reasoning, or numerical probabilities.'
+    )
+    return '\n\n'.join(sections)

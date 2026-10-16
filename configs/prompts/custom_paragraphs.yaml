@@ -1,0 +1,16 @@
+# Literal paragraphs: braces and percent signs have no special meaning.
+# Edit these texts without changing the renderer, provider, or sampling loop.
+prompt_cfg:
+    strategy: configurable
+    history_format: counts_mean_probs
+    treatment: summary_neutral
+    extra_system_paragraphs:
+        - |-
+            Previous sampled answers are not correctness feedback.
+    extra_user_paragraphs:
+        before_history:
+            - |-
+                The following block summarizes earlier sampling steps.
+        after_history:
+            - |-
+                Consider all available answer choices before selecting your answer.

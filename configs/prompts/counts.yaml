@@ -1,0 +1,4 @@
+prompt_cfg:
+    strategy: configurable
+    history_format: counts
+    treatment: summary_neutral

@@ -9,6 +9,7 @@ import openai
 from typing import Callable, List, Optional, Tuple
 from openai import PermissionDeniedError
 from .system_prompt import mcqa_system_prompt
+from .prompt_types import RenderedPrompt
 
 from google import genai
 from google.genai import types
@@ -287,12 +288,13 @@ def extract_choice_labels(prompt: str) -> list[str]:
 
 
 def _prompt_label_info(
-    prompt: str,
+    prompt: str | RenderedPrompt,
     label_chars: List[str],
 ) -> Tuple[List[str], np.ndarray, List[int]]:
     """Return the prompt's valid labels, global mask, and global indices."""
 
-    valid_labels = extract_choice_labels(prompt)
+    valid_labels = (list(prompt.valid_labels) if isinstance(prompt, RenderedPrompt)
+                    else extract_choice_labels(prompt))
     unknown_labels = [label for label in valid_labels if label not in label_chars]
     if unknown_labels:
         raise ValueError(
@@ -304,6 +306,18 @@ def _prompt_label_info(
     valid_mask = np.zeros(len(label_chars), dtype=bool)
     valid_mask[valid_indices] = True
     return valid_labels, valid_mask, valid_indices
+
+
+def _normalize_sampling_prompt(prompt: str | RenderedPrompt) -> RenderedPrompt:
+    """Accept old strings or explicit messages without changing answer scoring.
+
+    Only old strings are parsed. New paragraphs may contain text such as
+    ``E) ...`` without accidentally adding an answer choice.
+    """
+    if isinstance(prompt, RenderedPrompt):
+        return prompt
+    labels = tuple(extract_choice_labels(prompt))
+    return RenderedPrompt(mcqa_system_prompt(len(labels)), prompt, labels)
 
 
 def _embed_prompt_probabilities(
@@ -1047,10 +1061,13 @@ def _build_local_hf_martingale_sampling_provider(
     temperature: float = 0.5,
     raw_log_path: Optional[str] = None,
     log_top_k: int = 20,
-) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+) -> Callable[[List[str | RenderedPrompt]], Tuple[np.ndarray, np.ndarray]]:
     """
     Load a Hugging Face model locally and construct a provider compatible with
     run_martingale_sampling_check.
+
+    Accepts legacy user strings or RenderedPrompt messages. The assistant
+    prefill, tokenization, and next-token scoring are identical for both.
 
     Returns
     -------
@@ -1103,14 +1120,15 @@ def _build_local_hf_martingale_sampling_provider(
         candidate_token_ids[label] = sorted(token_ids)
 
     def get_probs(
-        prompts: List[str],
+        prompts: List[str | RenderedPrompt],
     ) -> Tuple[np.ndarray, np.ndarray]:
 
         conversations = []
         valid_label_lists = []
-        for prompt in prompts:
+        requests = [_normalize_sampling_prompt(prompt) for prompt in prompts]
+        for request in requests:
             ## Different questions have different final labels
-            valid_labels = extract_choice_labels(prompt)
+            valid_labels = list(request.valid_labels)
             unknown_labels = set(valid_labels) - set(label_chars)
             if unknown_labels:
                 raise ValueError(
@@ -1123,11 +1141,11 @@ def _build_local_hf_martingale_sampling_provider(
             conversations.append([
                 {
                     "role": "system",
-                    "content": mcqa_system_prompt(len(valid_labels)),
+                    "content": request.system_text,
                 },
                 {
                     "role": "user",
-                    "content": prompt,
+                    "content": request.user_text,
                 },
                 {
                     "role": "assistant",
@@ -1255,7 +1273,8 @@ def _build_local_hf_martingale_sampling_provider(
                     "provider": "local_transformers_martingale_sampling",
                     "model_name": model_name,
                     "prompt_index": prompt_index,
-                    "prompt": prompt,
+                    "prompt": requests[prompt_index].user_text,
+                    "system_prompt": requests[prompt_index].system_text,
                     "formatted_prompt": tokenizer.decode(
                         valid_ids, skip_special_tokens=False
                     ),
@@ -1310,8 +1329,11 @@ def _build_openai_martingale_sampling_provider(
     temperature: float = 0.5,
     missing_probability: float = 1e-10,
     missing_probability_factor: float = 10.0,
-) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+) -> Callable[[List[str | RenderedPrompt]], Tuple[np.ndarray, np.ndarray]]:
     """Build the OpenAI scorer for the exact branching experiment.
+
+    Inputs can be legacy user strings or RenderedPrompt messages with explicit
+    labels. Only message assembly changes; probability extraction is shared.
 
     The returned ``get_probs(prompts)`` callable returns a pair:
 
@@ -1337,14 +1359,16 @@ def _build_openai_martingale_sampling_provider(
     client = openai.OpenAI(api_key=api)
     n_classes = len(label_chars)
 
-    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    def get_probs(prompts: List[str | RenderedPrompt]) -> Tuple[np.ndarray, np.ndarray]:
         class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
         probabilities = np.zeros_like(class_scores)
 
         for prompt_index, prompt in enumerate(prompts):
+            request = _normalize_sampling_prompt(prompt)
             valid_labels, valid_mask, valid_indices = _prompt_label_info(
-                prompt, label_chars
+                request, label_chars
             )
+            prompt = request.user_text
             try:
                 response = _retry_with_backoff(
                     lambda: client.chat.completions.create(
@@ -1352,7 +1376,7 @@ def _build_openai_martingale_sampling_provider(
                         messages=[
                             {
                                 "role": "system",
-                                "content": mcqa_system_prompt(len(valid_labels)),
+                                "content": request.system_text,
                             },
                             {"role": "user", "content": prompt},
                         ],
@@ -1396,6 +1420,7 @@ def _build_openai_martingale_sampling_provider(
                     "model_name": model_name,
                     "prompt_index": prompt_index,
                     "prompt": prompt,
+                    "system_prompt": request.system_text,
                     "valid_labels": valid_labels,
                     "valid_class_mask": valid_mask.tolist(),
                     "temperature": temperature,
@@ -1455,8 +1480,11 @@ def _build_deepseek_martingale_sampling_provider(
     temperature: float = 0.5,
     missing_probability: float = 1e-10,
     missing_probability_factor: float = 10.0,
-) -> Callable[[List[str]], Tuple[np.ndarray, np.ndarray]]:
+) -> Callable[[List[str | RenderedPrompt]], Tuple[np.ndarray, np.ndarray]]:
     """Build the DeepSeek scorer for the exact branching experiment.
+
+    Accepts legacy user strings and RenderedPrompt messages, using the same
+    label scoring and decoding parameters for both forms.
 
     The returned ``get_probs(prompts)`` callable returns a pair:
 
@@ -1482,14 +1510,16 @@ def _build_deepseek_martingale_sampling_provider(
     client = openai.OpenAI(api_key=api, base_url="https://api.deepseek.com")
     n_classes = len(label_chars)
 
-    def get_probs(prompts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    def get_probs(prompts: List[str | RenderedPrompt]) -> Tuple[np.ndarray, np.ndarray]:
         class_scores = np.zeros((len(prompts), n_classes), dtype=np.float64)
         probabilities = np.zeros_like(class_scores)
 
         for prompt_index, prompt in enumerate(prompts):
+            request = _normalize_sampling_prompt(prompt)
             valid_labels, valid_mask, valid_indices = _prompt_label_info(
-                prompt, label_chars
+                request, label_chars
             )
+            prompt = request.user_text
             try:
                 response = _retry_with_backoff(
                     lambda: client.chat.completions.create(
@@ -1497,7 +1527,7 @@ def _build_deepseek_martingale_sampling_provider(
                         messages=[
                             {
                                 "role": "system",
-                                "content": mcqa_system_prompt(len(valid_labels)),
+                                "content": request.system_text,
                             },
                             {"role": "user", "content": prompt},
                         ],
@@ -1541,6 +1571,7 @@ def _build_deepseek_martingale_sampling_provider(
                     "model_name": model_name,
                     "prompt_index": prompt_index,
                     "prompt": prompt,
+                    "system_prompt": request.system_text,
                     "valid_labels": valid_labels,
                     "valid_class_mask": valid_mask.tolist(),
                     "temperature": temperature,
@@ -1591,4 +1622,3 @@ def _build_deepseek_martingale_sampling_provider(
         "openai_version": getattr(openai, "__version__", "unknown"),
     }
     return get_probs
-

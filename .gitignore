@@ -31,6 +31,7 @@ MANIFEST
 
 tmp/
 tests/
+examples/
 # PyInstaller
 #   Usually these files are written by a python script from a template
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -239,8 +240,14 @@ data/results_mp*/**/raw_ppr_responses_*.jsonl
 # Only martingale_property.py is versioned under tools/
 tools/*
 !tools/martingale_property.py
+!tools/preview_prompt_strategies.py
 
 # Local tests and generated output
+!/tests/
 /tests/*
+!/tests/test_gpqa_dataset.py
 !/tests/test_local_mcqa_dataset.py
+!/tests/test_prompt_strategies.py
+!/tests/test_prompt_sampling.py
+!/tests/test_prompt_providers.py
 /output/

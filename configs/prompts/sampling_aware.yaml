@@ -1,0 +1,5 @@
+prompt_cfg:
+    strategy: configurable
+    history_format: counts_mean_probs
+    treatment: sampling_aware
+    probability_decimals: 6

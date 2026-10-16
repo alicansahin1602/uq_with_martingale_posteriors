@@ -1,0 +1,3 @@
+# Exact original prompts; this is also the default when prompt_cfg is omitted.
+prompt_cfg:
+    strategy: legacy

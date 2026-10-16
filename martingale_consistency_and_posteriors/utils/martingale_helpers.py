@@ -5,6 +5,9 @@ import transformers
 import numpy as np
 import mmengine
 import os.path as osp
+from .prompt_types import HistoryState, PromptContext, RenderedPrompt
+from .prompt_strategies import build_prompt_strategy, insert_legacy_history
+from .model_calls import extract_choice_labels
 
 
 _ANSWER_SUFFIX = "\nAnswer:"
@@ -28,22 +31,12 @@ def _insert_prev_answers(initial_prompt: str, prev_labels: List[str]) -> str:
         Your previous answers were: A, C, B
         Answer:
     """
-    if not prev_labels:
-        return initial_prompt
-    
-    if not initial_prompt.endswith(_ANSWER_SUFFIX):
-        raise ValueError(
-            f"Prompt does not end with '{_ANSWER_SUFFIX}'. "
-            "Check that the dataset preamble is unchanged."
-        )
-    body = initial_prompt[: -len(_ANSWER_SUFFIX)]
-    history = ", ".join(prev_labels)
-    return f"{body}\nYour prior answers in previous steps to this specific question were: {history}{_ANSWER_SUFFIX}"
+    return insert_legacy_history(initial_prompt, prev_labels)
 
 
 def _call_martingale_sampling_get_probs(
-    get_probs: Callable[[List[str]], Tuple[np.ndarray, np.ndarray]],
-    prompts: List[str],
+    get_probs: Callable[[List[str | RenderedPrompt]], Tuple[np.ndarray, np.ndarray]],
+    prompts: List[str | RenderedPrompt],
     n_classes: int,
     batch_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -97,7 +90,7 @@ def _call_martingale_sampling_get_probs(
 
 
 def run_martingale_sampling_check(
-    get_probs: Callable[[List[str]], Tuple[np.ndarray, np.ndarray]],
+    get_probs: Callable[[List[str | RenderedPrompt]], Tuple[np.ndarray, np.ndarray]],
     n_classes: int,
     dataset,
     rng: np.random.Generator,
@@ -108,6 +101,7 @@ def run_martingale_sampling_check(
     logger=None,
     label_chars: Optional[List[str]] = None,
     J: int = 20,
+    prompt_strategy=None,
 ) -> dict:
     """Run the exact local branching martingale-consistency experiment.
 
@@ -129,6 +123,10 @@ def run_martingale_sampling_check(
     per-(question, replication) seeds, residuals, scalar residual norms,
     entropy, centred logits, and JSD from the initial distribution are also
     retained for reproducibility and downstream plotting.
+
+    ``prompt_strategy=None`` preserves the original strings passed to providers.
+    Other strategies receive immutable histories and return explicit messages.
+    The probability extraction and martingale calculation are not changed.
     """
     if K < 1:
         raise ValueError("K must be at least 1.")
@@ -142,8 +140,11 @@ def run_martingale_sampling_check(
         label_chars = [chr(ord("A") + i) for i in range(n_classes)]
     if len(label_chars) != n_classes or len(set(label_chars)) != n_classes:
         raise ValueError("label_chars must contain one unique label per class.")
+    strategy = prompt_strategy or build_prompt_strategy()
 
     Q = min(n_samples, len(dataset)) if n_samples is not None else len(dataset)
+    if Q < 1:
+        raise ValueError('At least one question must be selected.')
     selected_indices = rng.choice(len(dataset), size=Q, replace=False)
 
     logits = np.zeros((Q, J, K, n_classes), dtype=np.float64)
@@ -162,16 +163,36 @@ def run_martingale_sampling_check(
     branch_prompt_history = np.empty(
         (Q, J, max(K - 1, 0), n_classes), dtype=object
     )
+    system_prompt_history = np.empty((Q, J, K), dtype=object)
+    branch_system_prompt_history = np.empty_like(branch_prompt_history)
+    valid_class_masks = np.zeros((Q, n_classes), dtype=bool)
     trajectory_seeds = np.zeros((Q, J), dtype=np.uint64)
     true_labels = np.zeros(Q, dtype=np.int32)
     input_texts: List[str] = []
     initial_prompts: List[str] = []
+    valid_label_lists = []
+    initial_requests = []
 
     for q, dataset_idx in enumerate(selected_indices):
         sample = dataset[int(dataset_idx)]
         initial_prompts.append(sample["prompt"])
         input_texts.append(sample["prompt"])
         true_labels[q] = int(sample["label"])
+        valid_labels = tuple(extract_choice_labels(sample['prompt']))
+        if not set(valid_labels).issubset(label_chars):
+            raise ValueError('Dataset choices are not supported by label_chars.')
+        valid_label_lists.append(valid_labels)
+        valid_class_masks[q] = [label in valid_labels for label in label_chars]
+        initial_requests.append(strategy.render(PromptContext(
+            sample['prompt'], valid_labels, probability_labels=tuple(label_chars),
+        )))
+
+    def evaluate(requests):
+        """Keep legacy string-only callers working; new providers accept messages."""
+        provider_inputs = [r.user_text for r in requests] if strategy.is_legacy else requests
+        return _call_martingale_sampling_get_probs(
+            get_probs, provider_inputs, n_classes, batch_size,
+        )
 
     try:
         all_row_ids = dataset.get_data_indices()
@@ -183,9 +204,7 @@ def run_martingale_sampling_check(
 
     # p_0 is identical across replications for a question. Query it once and
     # copy it into each independent trajectory, saving (R-1) calls per question.
-    initial_logits, initial_probs = _call_martingale_sampling_get_probs(
-        get_probs, initial_prompts, n_classes, batch_size
-    )
+    initial_logits, initial_probs = evaluate(initial_requests)
 
     for q in range(Q):
         for j in range(J):
@@ -196,9 +215,9 @@ def run_martingale_sampling_check(
             ).generate_state(1, dtype=np.uint64)[0]
             trajectory_seeds[q, j] = trajectory_seed
             trajectory_rng = np.random.default_rng(trajectory_seed)
-            history: List[str] = []
+            history = HistoryState()
 
-            current_prompt = initial_prompts[q]
+            current_prompt = initial_requests[q]
             current_logits = initial_logits[q]
             current_probs = initial_probs[q]
 
@@ -213,30 +232,41 @@ def run_martingale_sampling_check(
                 # selected at t-1; no duplicate provider request is necessary.
                 logits[q, j, k] = current_logits
                 probs[q, j, k] = current_probs
-                prompt_history[q, j, k] = current_prompt
+                prompt_history[q, j, k] = current_prompt.user_text
+                system_prompt_history[q, j, k] = current_prompt.system_text
 
                 if k == K - 1:
                     break
 
                 # Every branch starts from this exact history and differs only
                 # in the single hypothetical label appended to it.
-                local_branch_prompts = [
-                    _insert_prev_answers(
-                        initial_prompts[q], history + [label_chars[y]]
-                    )
-                    for y in range(n_classes)
-                ]
-                local_branch_logits, local_branch_probs = (
-                    _call_martingale_sampling_get_probs(
-                        get_probs,
-                        local_branch_prompts,
-                        n_classes,
-                        batch_size,
-                    )
-                )
+                # Legacy retains even its zero-weight absent-label queries. New
+                # strategies skip absent choices (e.g. E in an A-D ARC question).
+                branch_indices = (list(range(n_classes)) if strategy.is_legacy
+                                  else np.flatnonzero(valid_class_masks[q]).tolist())
+                if not strategy.is_legacy and np.any(current_probs[~valid_class_masks[q]] != 0):
+                    raise ValueError('Provider assigned probability to an absent answer choice.')
+                child_histories = {
+                    y: history.advance(label_chars[y], current_probs) for y in branch_indices
+                }
+                local_branch_prompts = {
+                    y: strategy.render(PromptContext(
+                        initial_prompts[q], valid_label_lists[q], child_histories[y],
+                        tuple(label_chars),
+                    )) for y in branch_indices
+                }
+                child_logits, child_probs = evaluate(list(local_branch_prompts.values()))
+                local_branch_logits = np.zeros((n_classes, n_classes))
+                local_branch_probs = np.zeros((n_classes, n_classes))
+                local_branch_logits[branch_indices] = child_logits
+                local_branch_probs[branch_indices] = child_probs
                 branch_logits[q, j, k] = local_branch_logits
                 branch_probs[q, j, k] = local_branch_probs
-                branch_prompt_history[q, j, k] = local_branch_prompts
+                branch_prompt_history[q, j, k] = ''
+                branch_system_prompt_history[q, j, k] = ''
+                for y, request in local_branch_prompts.items():
+                    branch_prompt_history[q, j, k, y] = request.user_text
+                    branch_system_prompt_history[q, j, k, y] = request.system_text
 
                 # Weight every hypothetical continuation by p_t for the local
                 # residual, then draw the actual continuation from p_t below.
@@ -251,9 +281,8 @@ def run_martingale_sampling_check(
                 selected_idx = int(
                     trajectory_rng.choice(n_classes, p=current_probs)
                 )
-                #selected_idx = int(np.argmax(current_probs))
                 labels[q, j, k] = selected_idx
-                history.append(label_chars[selected_idx])
+                history = child_histories[selected_idx]
 
                 # Continue only the sampled branch and reuse its already
                 # evaluated distribution/logit-equivalent scores.
@@ -290,7 +319,16 @@ def run_martingale_sampling_check(
             "K": int(K),
             "C": int(n_classes),
             "label_chars": list(label_chars),
-            "prompt_history_template": "<initial prompt body>\\nYour previous answers: <comma-separated labels>\\nAnswer:",
+            "prompt_history_template": (
+                '<initial prompt body>\\nYour prior answers in previous steps to this specific '
+                'question were: <comma-separated labels>\\nAnswer:'
+                if strategy.is_legacy else 'See prompt_cfg and exact saved message histories.'
+            ),
+            "prompt_cfg": strategy.config,
+            "prompt_strategy_version": strategy.version,
+            "prompt_fingerprint": strategy.fingerprint,
+            "absent_branch_policy": ('legacy queries' if strategy.is_legacy
+                                     else 'not queried; zero arrays and empty message strings'),
             "sampling_rule": "numpy.random.Generator.choice(C, p=p_t)",
             "dtype": str(probs.dtype),
         }
@@ -323,6 +361,9 @@ def run_martingale_sampling_check(
         "trajectory_seeds": trajectory_seeds,
         "prompt_history": prompt_history,
         "branch_prompt_history": branch_prompt_history,
+        "system_prompt_history": system_prompt_history,
+        "branch_system_prompt_history": branch_system_prompt_history,
+        "valid_class_mask": valid_class_masks,
         "metadata": metadata,
     }
 

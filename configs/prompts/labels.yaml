@@ -1,0 +1,4 @@
+prompt_cfg:
+    strategy: configurable
+    history_format: labels
+    treatment: summary_neutral
