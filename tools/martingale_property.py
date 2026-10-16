@@ -46,8 +46,7 @@ from martingale_consistency_and_posteriors import (
      DATASETS,
      get_model_and_tokenizer,
      setup_logger,
-     _build_hf_provider,
-     _build_hf_martingale_sampling_provider,
+     _build_local_hf_provider,
      _build_local_hf_martingale_sampling_provider,
      _build_openai_provider,
      _build_deepseek_provider,
@@ -196,6 +195,20 @@ def main():
     provider = api_cfg.provider.lower()
     n_api_samples = args.n_api_samples or api_cfg.get("n_api_samples", 30)
 
+    ## Open-source models run locally: load the model & tokenizer once for both modes
+    if provider == "huggingface":
+        model, tokenizer = get_model_and_tokenizer(
+            model_name_or_path=api_cfg.model_name,
+            model_cfg=api_cfg.model_cfg,
+            tokenizer_cfg=api_cfg.tokenizer_cfg,
+            special_tokens=api_cfg.special_tokens,
+            device=device,
+        )
+        model.eval()
+        ## Local forward passes can be batched (default 1 keeps the old behaviour)
+        batch_size = api_cfg.get("batch_size", None)
+        logger.info(f"Local HuggingFace model: {api_cfg.model_name} on {device}")
+
     if args.mode == "sampling":
         if provider == "openai":
             get_probs = _build_openai_martingale_sampling_provider(
@@ -216,36 +229,13 @@ def main():
                 raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
             )
         elif provider == 'huggingface':
-            if not api_cfg.is_local:
-                ## Do not load the model & tokenizer. Make an API call.
-                get_probs = _build_hf_martingale_sampling_provider(
-                    model_name=api_cfg.model_name,
-                    label_chars=label_chars,
-                    api=os.getenv("HUGGINGFACE_API_KEY"),
-                    raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
-                    inference_provider = api_cfg.inference_provider
-                )
-            else:
-                ## Locally load the model & tokenizer
-                tokenizer_run_cfg = dict(cfg.tokenizer_run_cfg)
-                model, tokenizer = get_model_and_tokenizer(
-                    model_name_or_path=api_cfg.model_name,
-                    model_cfg=api_cfg.model_cfg,
-                    tokenizer_cfg=api_cfg.tokenizer_cfg,
-                    special_tokens=api_cfg.special_tokens
-
-                ) ## Default to cuda:0
-                model.eval()
-                get_probs = _build_local_hf_martingale_sampling_provider(
-                    model_name = api_cfg.model_name,
-                    model = model,
-                    tokenizer = tokenizer, 
-                    label_chars=label_chars,
-                    raw_log_path=osp.join(
-                        work_dir,
-                        f"raw_direct_query_responses_{timestamp}.jsonl",
-                    ),
-                )
+            get_probs = _build_local_hf_martingale_sampling_provider(
+                model_name=api_cfg.model_name,
+                model=model,
+                tokenizer=tokenizer,
+                label_chars=label_chars,
+                raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
+            )
 
         else:
             raise ValueError(
@@ -273,13 +263,14 @@ def main():
                 raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
             )
         elif provider == "huggingface":
-            get_probs = _build_hf_provider(
+            get_probs = _build_local_hf_provider(
                 model_name=api_cfg.model_name,
+                model=model,
+                tokenizer=tokenizer,
                 label_chars=label_chars,
                 use_logprobs=api_cfg.get("use_logprobs", False),
-                n_api_samples=n_api_samples,
-                api=os.getenv("HUGGINGFACE_API_KEY"),
-                raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl")
+                n_samples=n_api_samples,
+                raw_log_path=osp.join(work_dir, f"raw_direct_query_responses_{timestamp}.jsonl"),
             )
         else:
             raise ValueError(f"Unknown api_model.provider '{provider}'.")

@@ -2,14 +2,12 @@ from .logging import setup_logger
 from .misc import save_predictions
 from .typing import Device
 from .model_calls import (
-    _build_hf_provider,
+    _build_local_hf_provider,
     _build_openai_provider,
     _build_deepseek_provider,
-    _build_hf_martingale_sampling_provider,
     _build_openai_martingale_sampling_provider,
     _build_deepseek_martingale_sampling_provider,
     _build_local_hf_martingale_sampling_provider,
-
 )
 from .martingale_helpers import (
     run_martingale_check,
@@ -29,7 +27,7 @@ __all__ = [
     'setup_logger',
     'Device',
     'save_predictions',
-    '_build_hf_provider',
+    '_build_local_hf_provider',
     '_build_openai_provider',
     '_build_openai_martingale_sampling_provider',
     '_build_deepseek_provider',
@@ -43,7 +41,6 @@ __all__ = [
     'compute_martingale_posterior_metrics',
     'mcqa_system_prompt',
     'run_martingale_sampling_check',
-    '_build_hf_martingale_sampling_provider',
     '_build_openai_martingale_sampling_provider',
     "_build_deepseek_martingale_sampling_provider",
     "_build_local_hf_martingale_sampling_provider",
