@@ -30,7 +30,7 @@ share/python-wheels/
 MANIFEST
 
 tmp/
-
+tests/
 # PyInstaller
 #   Usually these files are written by a python script from a template
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -231,8 +231,16 @@ data/results_mp*/**/raw_ppr_responses_*.jsonl
 # Office lock files (e.g. left behind by an open .xlsx)
 **/~$*.xlsx
 
-/data/
+/data/*
+!/data/datasets/
+/data/datasets/*
+!/data/datasets/simple_mcqa.json
 
 # Only martingale_property.py is versioned under tools/
 tools/*
 !tools/martingale_property.py
+
+# Local tests and generated output
+/tests/*
+!/tests/test_local_mcqa_dataset.py
+/output/

@@ -1324,9 +1324,9 @@ def _build_openai_martingale_sampling_provider(
     omitted by the truncated top-20 response use an adaptive finite imputation
     capped by ``missing_probability``; the rule is recorded in the metadata.
 
-    Sampling the trajectory is deliberately *not* delegated to OpenAI. The
-    runner uses ``numpy.random.Generator.choice`` directly on the returned
-    five-class vector, making the actual continuation distribution q_t=p_t.
+    The runner samples the next history label using ``Generator.choice`` from the
+    returned class probabilities. Local residuals still weight every
+    hypothetical continuation by its probability in the current vector.
     """
     if len(label_chars) > 20:
         raise ValueError(
@@ -1469,9 +1469,9 @@ def _build_deepseek_martingale_sampling_provider(
     omitted by the truncated top-20 response use an adaptive finite imputation
     capped by ``missing_probability``; the rule is recorded in the metadata.
 
-    Sampling the trajectory is deliberately *not* delegated to OpenAI. The
-    runner uses ``numpy.random.Generator.choice`` directly on the returned
-    five-class vector, making the actual continuation distribution q_t=p_t.
+    The runner samples the next history label using ``Generator.choice`` from the
+    returned class probabilities. Local residuals still weight every
+    hypothetical continuation by its probability in the current vector.
     """
     if len(label_chars) > 20:
         raise ValueError(

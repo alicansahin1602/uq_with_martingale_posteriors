@@ -121,7 +121,7 @@ def run_martingale_sampling_check(
     so a prompt is never queried twice within one trajectory.
 
     Parameters follow the notation in ``martingale_consistency_experiment.md``:
-    ``n_samples`` is Q, ``R`` is the number of independent replications, and
+    ``n_samples`` is Q, ``R`` is the number of replications, and
     ``K`` is the number of stored prediction steps (there are K-1 transitions).
 
     The returned tensors have shapes ``(Q, R, K, C)`` for ``logits``/``probs``
@@ -238,8 +238,8 @@ def run_martingale_sampling_check(
                 branch_probs[q, j, k] = local_branch_probs
                 branch_prompt_history[q, j, k] = local_branch_prompts
 
-                # Direct categorical continuation means the weighting
-                # distribution q_t is exactly the model distribution p_t.
+                # Weight every hypothetical continuation by p_t for the local
+                # residual, then draw the actual continuation from p_t below.
                 local_expected_next = current_probs @ local_branch_probs
                 local_residual = local_expected_next - current_probs
                 expected_next[q, j, k] = local_expected_next
@@ -248,17 +248,18 @@ def run_martingale_sampling_check(
                 error_l2[q, j, k] = np.linalg.norm(local_residual)
                 error_max[q, j, k] = np.abs(local_residual).max()
 
-                sampled_idx = int(
+                selected_idx = int(
                     trajectory_rng.choice(n_classes, p=current_probs)
                 )
-                labels[q, j, k] = sampled_idx
-                history.append(label_chars[sampled_idx])
+                #selected_idx = int(np.argmax(current_probs))
+                labels[q, j, k] = selected_idx
+                history.append(label_chars[selected_idx])
 
                 # Continue only the sampled branch and reuse its already
                 # evaluated distribution/logit-equivalent scores.
-                current_prompt = local_branch_prompts[sampled_idx]
-                current_logits = local_branch_logits[sampled_idx]
-                current_probs = local_branch_probs[sampled_idx]
+                current_prompt = local_branch_prompts[selected_idx]
+                current_logits = local_branch_logits[selected_idx]
+                current_probs = local_branch_probs[selected_idx]
 
     centered_logits = logits - logits.mean(axis=-1, keepdims=True)
     safe_probs = np.clip(probs, 1e-300, 1.0)
